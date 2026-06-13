@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         LiXin Library Seat Helper
 // @namespace    https://kjyy.lixin.edu.cn/
-// @version      1.0.0
+// @version      2.0.0
 // @description  上海立信会计金融学院 IC 空间座位预约辅助：点座位自动填号、每日定时预约、任务列表与取消。
 // @author       顾佳俊
 // @match        https://kjyy.lixin.edu.cn/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_notification
+// @grant        unsafeWindow
 // ==/UserScript==
 
 (function () {
@@ -17,7 +18,20 @@
   const SETTINGS_KEY = 'lixin-seat-helper.form.v1';
   const TICK_MS = 1000;
   const RUN_GRACE_MS = 10 * 60 * 1000;
+  const LOGIN_CHECK_INTERVAL_MS = 10 * 1000;
+  const LOGIN_PROBE_FALLBACK_PATH = '/ic-web/auth/userInfo';
+  const LOGIN_RESPONSE_PREVIEW_LIMIT = 3000;
   const DEFAULT_APPLY_NOTE = '';
+  const DAY_OPTION_DEFINITIONS = [
+    { value: '今天', offset: 0, name: '今天' },
+    { value: '明天', offset: 1, name: '明天' },
+    { value: '+2', offset: 2, name: '后天' },
+    { value: '+3', offset: 3, name: '三天后' },
+    { value: '+4', offset: 4, name: '四天后' },
+    { value: '+5', offset: 5, name: '五天后' },
+    { value: '+6', offset: 6, name: '六天后' },
+    { value: '+7', offset: 7, name: '七天后' }
+  ];
 
   const STATUS_LABELS = {
     green: '空闲',
@@ -32,6 +46,13 @@
     panelOpen: false,
     busy: false,
     automationClicking: false,
+    loginCheck: {
+      status: 'pending',
+      message: '等待首次检测',
+      nextAt: Date.now(),
+      lastCheckedAt: 0,
+      checking: false
+    },
     toastTimer: 0
   };
 
@@ -44,13 +65,21 @@
     createUi();
     bindSeatPicker();
     render();
-    setInterval(schedulerTick, TICK_MS);
+    setInterval(appTick, TICK_MS);
     window.addEventListener('hashchange', () => {
       state.form.routeHash = location.hash;
       state.form.roomName = getRoomName();
       saveForm();
       render();
     });
+  }
+
+  function getPageWindow() {
+    try {
+      return typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+    } catch {
+      return window;
+    }
   }
 
   function injectStyle() {
@@ -139,6 +168,55 @@
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 10px;
+      }
+      .lsh-login-status {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-height: 42px;
+        padding: 8px 10px;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        background: #f8fafc;
+      }
+      .lsh-login-dot {
+        flex: 0 0 auto;
+        width: 8px;
+        height: 8px;
+        margin-top: 5px;
+        border-radius: 50%;
+        background: #94a3b8;
+      }
+      .lsh-login-status[data-state="ok"] .lsh-login-dot {
+        background: #16a34a;
+      }
+      .lsh-login-status[data-state="checking"] .lsh-login-dot,
+      .lsh-login-status[data-state="pending"] .lsh-login-dot {
+        background: #0ea5e9;
+      }
+      .lsh-login-status[data-state="failed"] .lsh-login-dot {
+        background: #dc2626;
+      }
+      .lsh-login-status[data-state="skipped"] .lsh-login-dot,
+      .lsh-login-status[data-state="warn"] .lsh-login-dot {
+        background: #d97706;
+      }
+      .lsh-login-copy {
+        min-width: 0;
+      }
+      .lsh-login-label {
+        color: #0f172a;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.35;
+      }
+      .lsh-login-detail {
+        margin-top: 2px;
+        color: #64748b;
+        font-size: 12px;
+        line-height: 1.35;
+        word-break: break-word;
       }
       .lsh-field {
         display: flex;
@@ -243,6 +321,13 @@
         line-height: 1.45;
         word-break: break-word;
       }
+      .lsh-task-countdown {
+        margin-top: 4px;
+        color: #146c94;
+        font-size: 12px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
       .lsh-cancel {
         flex: 0 0 auto;
         height: 28px;
@@ -300,6 +385,13 @@
         <div class="lsh-body">
           <div class="lsh-room"></div>
           <div class="lsh-grid">
+            <div class="lsh-login-status" data-lsh-login-status data-state="pending">
+              <span class="lsh-login-dot"></span>
+              <div class="lsh-login-copy">
+                <div class="lsh-login-label" data-lsh-login-label>登录状态：等待检测</div>
+                <div class="lsh-login-detail" data-lsh-login-detail>下次检测：-- 秒后</div>
+              </div>
+            </div>
             <div class="lsh-field lsh-field-wide">
               <label>目标座位号</label>
               <input data-lsh-field="seatId" autocomplete="off" placeholder="例如 PDW3FA3001">
@@ -338,6 +430,9 @@
     dom.submit = root.querySelector('.lsh-primary');
     dom.taskList = root.querySelector('.lsh-task-list');
     dom.count = root.querySelector('[data-lsh-count]');
+    dom.loginStatus = root.querySelector('[data-lsh-login-status]');
+    dom.loginLabel = root.querySelector('[data-lsh-login-label]');
+    dom.loginDetail = root.querySelector('[data-lsh-login-detail]');
     dom.fields = {
       seatId: root.querySelector('[data-lsh-field="seatId"]'),
       runAt: root.querySelector('[data-lsh-field="runAt"]'),
@@ -436,7 +531,7 @@
 
   function render() {
     if (!dom.panel) return;
-    if (!['今天', '明天', '+2', '+3', '+7'].includes(state.form.dayExpr)) {
+    if (!isValidDayExpr(state.form.dayExpr)) {
       state.form.dayExpr = '明天';
       saveForm();
     }
@@ -448,6 +543,7 @@
     dom.room.textContent = currentRoom
       ? `当前页面：${currentRoom} (${location.hash || '未进入座位预约页'})`
       : `当前页面：${location.hash || '未进入座位预约页'}`;
+    renderLoginCheck();
 
     for (const [key, input] of Object.entries(dom.fields)) {
       if (document.activeElement !== input) input.value = state.form[key] || '';
@@ -471,9 +567,214 @@
             <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">取消</button>
           </div>
           <div class="lsh-task-status">${escapeHtml(task.status || '等待执行')}</div>
+          <div class="lsh-task-countdown" data-lsh-countdown="${escapeHtml(task.id)}"></div>
         </div>
       `)
       .join('');
+    updateTaskCountdowns();
+  }
+
+  function appTick() {
+    schedulerTick();
+    loginCheckTick();
+    updateTaskCountdowns();
+  }
+
+  function renderLoginCheck() {
+    if (!dom.loginStatus) return;
+    const check = state.loginCheck;
+    const secondsLeft = check.checking
+      ? 0
+      : Math.max(0, Math.ceil((check.nextAt - Date.now()) / 1000));
+    const checkedAt = check.lastCheckedAt
+      ? `上次：${new Date(check.lastCheckedAt).toLocaleTimeString()}`
+      : '尚未检测';
+
+    dom.loginStatus.setAttribute('data-state', check.status);
+    dom.loginLabel.textContent = `登录状态：${loginStatusLabel(check.status)}`;
+    dom.loginDetail.textContent = check.checking
+      ? `${check.message}；正在检测；${checkedAt}`
+      : `${check.message}；下次检测：${secondsLeft} 秒后；${checkedAt}`;
+  }
+
+  function loginStatusLabel(status) {
+    return {
+      pending: '等待检测',
+      checking: '检测中',
+      ok: '正常',
+      failed: '可能已失效',
+      skipped: '暂缓检测',
+      warn: '无法确认'
+    }[status] || '未知';
+  }
+
+  function loginCheckTick() {
+    renderLoginCheck();
+    if (state.loginCheck.checking) return;
+    if (Date.now() < state.loginCheck.nextAt) return;
+    runLoginCheck();
+  }
+
+  async function runLoginCheck() {
+    const check = state.loginCheck;
+    const previousStatus = check.status;
+    check.checking = true;
+    check.status = 'checking';
+    check.message = '正在检测页面登录状态';
+    renderLoginCheck();
+
+    try {
+      const skipReason = loginCheckSkipReason();
+      const result = skipReason
+        ? { status: 'skipped', message: skipReason }
+        : await inspectLoginState();
+
+      check.status = result.status;
+      check.message = result.message;
+      if (result.status === 'failed' && previousStatus !== 'failed') {
+        notify('立信座位助手', result.message);
+        toast(result.message);
+      }
+    } catch (error) {
+      check.status = 'failed';
+      check.message = `检测失败：${error.message || error}`;
+      if (previousStatus !== 'failed') {
+        notify('立信座位助手', check.message);
+        toast(check.message);
+      }
+    } finally {
+      check.checking = false;
+      check.lastCheckedAt = Date.now();
+      check.nextAt = Date.now() + LOGIN_CHECK_INTERVAL_MS;
+      renderLoginCheck();
+    }
+  }
+
+  function loginCheckSkipReason() {
+    if (state.busy) return '自动任务执行中，暂缓登录检测';
+    if (getVisibleDialog()) return '页面弹窗打开中，暂缓登录检测';
+    const openPicker = Array.from(document.querySelectorAll('.el-picker-panel, .el-select-dropdown.el-popper'))
+      .some(visibleElement);
+    if (openPicker) return '日期或时间选择器打开中，暂缓登录检测';
+    return '';
+  }
+
+  async function inspectLoginState() {
+    return runLoginProbe(buildLoginProbe());
+  }
+
+  async function runLoginProbe(probe) {
+    const started = Date.now();
+    try {
+      const page = getPageWindow();
+      const pageFetch = page?.fetch?.bind(page) || fetch;
+      const response = await pageFetch(probe.url, {
+        cache: 'no-store',
+        credentials: 'include',
+        redirect: 'manual',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'x-lixin-seat-helper-probe': '1'
+        },
+        method: 'GET'
+      });
+      const responseText = response.type === 'opaqueredirect'
+        ? ''
+        : await response.clone().text().catch(() => '');
+      const record = {
+        contentType: response.headers.get('content-type') || '',
+        json: parseJson(responseText),
+        responseType: response.type || '',
+        status: response.status,
+        textPreview: responseText.slice(0, LOGIN_RESPONSE_PREVIEW_LIMIT),
+        url: response.url || probe.url
+      };
+      const judgement = judgeLoginProbeRecord(record);
+      const elapsed = Date.now() - started;
+
+      if (judgement.status === 'ok') {
+        return { status: 'ok', message: `网络检测正常：${probe.label}，HTTP ${response.status}，${elapsed}ms` };
+      }
+      if (judgement.status === 'failed') {
+        return { status: 'failed', message: `网络检测失败：${judgement.reason}，请求 ${probe.label}` };
+      }
+      return { status: 'warn', message: `网络响应无法确认：${probe.label}，HTTP ${response.status}` };
+    } catch (error) {
+      return { status: 'failed', message: `网络检测请求失败：${error.message || error}` };
+    }
+  }
+
+  function buildLoginProbe() {
+    const roomId = getCurrentRoomId();
+    if (roomId) {
+      const params = new URLSearchParams({
+        roomIds: roomId,
+        resvDates: toCompactDate(new Date()),
+        sysKind: '8'
+      });
+      return {
+        label: `座位查询 ${roomId}`,
+        url: `/ic-web/reserve?${params.toString()}`
+      };
+    }
+    return {
+      label: '用户信息',
+      url: LOGIN_PROBE_FALLBACK_PATH
+    };
+  }
+
+  function getCurrentRoomId() {
+    const match = String(location.hash || '').match(/\/ic\/seatPredetermine\/(\d+)/);
+    return match ? match[1] : '';
+  }
+
+  function judgeLoginProbeRecord(record) {
+    const status = Number(record.status) || 0;
+    const text = String(record.textPreview || '');
+    const lowerUrl = String(record.url || '').toLowerCase();
+    const loginFailure = /请登录|未登录|重新登录|登录超时|登录已失效|会话已失效|身份认证|认证失败|unauthorized|forbidden|session expired|token expired/i.test(text);
+    const authRedirect = record.responseType === 'opaqueredirect' || /atrust\.lixin\.edu\.cn|controller\/v1\/public\/verify|\/login\b|cas|sso/.test(lowerUrl);
+    const loginHtml = /text\/html/i.test(record.contentType) && /(login|password|请登录|统一身份|认证)/i.test(text);
+
+    if (authRedirect || status === 0) {
+      return { status: 'failed', reason: '请求被重定向到统一认证' };
+    }
+    if ([401, 403, 419, 440].includes(status) || loginFailure || loginHtml) {
+      return { status: 'failed', reason: `响应显示登录失效（HTTP ${status || '未知'}）` };
+    }
+    if (status >= 300 && status < 400) {
+      return { status: 'failed', reason: `响应发生重定向（HTTP ${status}）` };
+    }
+
+    const json = record.json || parseJson(text);
+    if (json) {
+      const code = json.code ?? json.status ?? json.statusCode;
+      const message = String(json.message || json.msg || json.repMsg || '');
+      if (code === 0 || code === '0' || message === '查询成功') {
+        return { status: 'ok', reason: `响应正常（HTTP ${status}）` };
+      }
+      if ([401, 403, 419, 440].includes(Number(code)) || /请登录|未登录|重新登录|登录超时|登录已失效|会话已失效|认证/.test(message)) {
+        return { status: 'failed', reason: `接口返回登录失效：${message || code}` };
+      }
+      return { status: 'warn', reason: `接口返回未知状态：${message || code || '无状态'}` };
+    }
+
+    if (status >= 200 && status < 300) {
+      return { status: 'warn', reason: `响应不是预期 JSON（HTTP ${status}）` };
+    }
+    return { status: 'warn', reason: `响应无法确认（HTTP ${status || '未知'}）` };
+  }
+
+  function parseJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  function toCompactDate(date) {
+    return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
   }
 
   function renderDayOptions() {
@@ -528,12 +829,10 @@
 
   function normalizeDayExpr(value) {
     const text = String(value || '').trim();
-    if (text === '今天') return '今天';
-    if (text === '明天') return '明天';
-    if (text === '后天' || text === '+2') return '+2';
-    if (text === '三天后' || text === '+3') return '+3';
-    if (text === '七天后' || text === '+7') return '+7';
-    return '';
+    return DAY_OPTION_DEFINITIONS.find(option => (
+      option.value === text ||
+      option.name === text
+    ))?.value || '';
   }
 
   function normalizeTimeRange(value) {
@@ -558,6 +857,52 @@
     });
     if (!dueTask) return;
     runTask(dueTask);
+  }
+
+  function updateTaskCountdowns() {
+    if (!dom.taskList) return;
+    const now = new Date();
+    const tasksById = new Map(state.tasks.map(task => [task.id, task]));
+    dom.taskList.querySelectorAll('[data-lsh-countdown]').forEach(node => {
+      const task = tasksById.get(node.getAttribute('data-lsh-countdown'));
+      node.textContent = task ? taskCountdownText(task, now) : '';
+    });
+  }
+
+  function taskCountdownText(task, now) {
+    if (task.running) return '倒计时：正在执行';
+
+    const todayKey = toDateText(now);
+    const runAt = normalizeRunAt(task.runAt);
+    if (!runAt) return '倒计时：执行时间无效';
+
+    const todayRunAt = scheduledDateTime(now, runAt);
+    const graceEndsAt = new Date(todayRunAt.getTime() + RUN_GRACE_MS);
+    let nextRunAt = todayRunAt;
+    let prefix = '距离执行';
+
+    if (task.lastRunOn === todayKey || now > graceEndsAt) {
+      nextRunAt = addDays(todayRunAt, 1);
+      prefix = '距离下次执行';
+    } else if (now >= todayRunAt) {
+      return '倒计时：已到时间，等待执行';
+    }
+
+    return `倒计时：${prefix} ${formatDuration(nextRunAt.getTime() - now.getTime())}`;
+  }
+
+  function formatDuration(ms) {
+    const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+    if (days) parts.push(`${days}天`);
+    if (days || hours) parts.push(`${hours}小时`);
+    if (days || hours || minutes) parts.push(`${minutes}分`);
+    parts.push(`${seconds}秒`);
+    return parts.join('');
   }
 
   async function runTask(task) {
@@ -778,24 +1123,14 @@
   }
 
   function resolveTargetDate(expr) {
-    const text = normalizeDayExpr(expr);
-    if (!text) throw new Error(`无法识别预约日期：${expr}`);
-    const today = startOfDay(new Date());
-    let offset = 0;
-    if (text === '明天') offset = 1;
-    else if (text.startsWith('+')) offset = Number(text.slice(1));
-    const target = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset);
+    const option = dayOptionByValue(normalizeDayExpr(expr));
+    if (!option) throw new Error(`无法识别预约日期：${expr}`);
+    const target = addDays(startOfDay(new Date()), option.offset);
     return toDateText(target);
   }
 
   function dayOptions() {
-    return [
-      { value: '今天', offset: 0, name: '今天' },
-      { value: '明天', offset: 1, name: '明天' },
-      { value: '+2', offset: 2, name: '后天' },
-      { value: '+3', offset: 3, name: '三天后' },
-      { value: '+7', offset: 7, name: '七天后' }
-    ].map(option => {
+    return DAY_OPTION_DEFINITIONS.map(option => {
       const date = addDays(new Date(), option.offset);
       return { value: option.value, label: `${option.name}（${date.getMonth() + 1}月${date.getDate()}日）` };
     });
@@ -803,6 +1138,14 @@
 
   function dayLabel(expr) {
     return dayOptions().find(option => option.value === expr)?.label || expr || '';
+  }
+
+  function dayOptionByValue(value) {
+    return DAY_OPTION_DEFINITIONS.find(option => option.value === value) || null;
+  }
+
+  function isValidDayExpr(value) {
+    return Boolean(dayOptionByValue(value));
   }
 
   function addDays(date, days) {
@@ -890,7 +1233,7 @@
       return tasks.map(task => ({
         ...task,
         runAt: task.runAt === '07:59:59' ? '22:30:00' : (normalizeRunAt(task.runAt) || '22:30:00'),
-        dayExpr: ['今天', '明天', '+2', '+3', '+7'].includes(task.dayExpr) ? task.dayExpr : '明天',
+        dayExpr: isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天',
         timeRange: normalizeTimeRange(task.timeRange) || '08:00-22:30'
       }));
     } catch {
@@ -914,7 +1257,7 @@
     try {
       const saved = { ...fallback, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
       if (saved.runAt === '07:59:59') saved.runAt = '22:30:00';
-      if (!['今天', '明天', '+2', '+3', '+7'].includes(saved.dayExpr)) saved.dayExpr = '明天';
+      if (!isValidDayExpr(saved.dayExpr)) saved.dayExpr = '明天';
       saved.timeRange = normalizeTimeRange(saved.timeRange) || '08:00-22:30';
       return saved;
     } catch {
