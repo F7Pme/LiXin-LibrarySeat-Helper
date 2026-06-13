@@ -2,7 +2,7 @@
 // @name         LiXin Library Seat Helper
 // @namespace    https://kjyy.lixin.edu.cn/
 // @version      2.0.0
-// @description  上海立信会计金融学院 IC 空间座位预约辅助：点座位自动填号、每日定时预约、任务列表与取消。
+// @description  上海立信会计金融学院 IC 空间座位预约辅助：点座位自动填号、定时预约、任务列表与取消。
 // @author       顾佳俊
 // @match        https://kjyy.lixin.edu.cn/*
 // @run-at       document-start
@@ -45,7 +45,6 @@
     form: loadForm(),
     panelOpen: false,
     busy: false,
-    automationClicking: false,
     loginCheck: {
       status: 'pending',
       message: '等待首次检测',
@@ -67,9 +66,11 @@
     render();
     setInterval(appTick, TICK_MS);
     window.addEventListener('hashchange', () => {
-      state.form.routeHash = location.hash;
-      state.form.roomName = getRoomName();
-      saveForm();
+      if (getCurrentRoomId()) {
+        state.form.routeHash = location.hash;
+        state.form.roomName = getRoomName();
+        saveForm();
+      }
       render();
     });
   }
@@ -397,8 +398,8 @@
               <input data-lsh-field="seatId" autocomplete="off" placeholder="例如 PDW3FA3001">
             </div>
             <div class="lsh-field">
-              <label>每天几点开始执行预约</label>
-              <input data-lsh-field="runAt" autocomplete="off" placeholder="例如 22:30:00">
+              <label>几点开始执行预约</label>
+              <input data-lsh-field="runAt" type="datetime-local" step="1" autocomplete="off">
             </div>
             <div class="lsh-field">
               <label>预约哪一天</label>
@@ -410,7 +411,7 @@
             </div>
           </div>
           <button class="lsh-primary" type="button">提交任务</button>
-          <div class="lsh-help">左键点击座位圆点会打开本面板并自动填入座位号；任务只会在本页面打开且到达设定时间时运行。</div>
+          <div class="lsh-help">左键点击座位圆点会打开本面板并自动填入座位号；任务会按记录的房间和设定时间发起网络预约。</div>
           <div class="lsh-section-title">
             <span>当前任务</span>
             <span data-lsh-count></span>
@@ -466,7 +467,6 @@
 
   function bindSeatPicker() {
     document.addEventListener('click', event => {
-      if (state.automationClicking) return;
       if (event.button !== 0) return;
       const seat = event.target.closest('.seat-area .grid .draggable[title]');
       if (!seat) return;
@@ -499,17 +499,25 @@
       return;
     }
 
-    const roomName = getRoomName();
+    const routeHash = getCurrentRoomId() ? location.hash : state.form.routeHash;
+    const roomName = getCurrentRoomId() ? getRoomName() : state.form.roomName;
+    if (!extractRoomId(routeHash)) {
+      toast('请先在目标座位预约房间页面创建任务或点选座位');
+      return;
+    }
     const task = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       seatId: parsed.seatId,
       runAt: parsed.runAt,
       dayExpr: parsed.dayExpr,
+      targetDate: resolveTargetDate(parsed.dayExpr),
       timeRange: parsed.timeRange,
-      routeHash: location.hash,
+      routeHash,
       roomName,
       createdAt: new Date().toISOString(),
       lastRunOn: '',
+      completedAt: '',
+      missedAt: '',
       running: false,
       status: '等待执行'
     };
@@ -561,7 +569,7 @@
           <div class="lsh-task-top">
             <div>
               <div class="lsh-task-seat">${escapeHtml(task.seatId)}</div>
-              <div class="lsh-task-meta">${escapeHtml(task.runAt)} / ${escapeHtml(dayLabel(task.dayExpr))} / ${escapeHtml(task.timeRange || '08:00-22:30')}</div>
+              <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || '08:00-22:30')}</div>
               <div class="lsh-task-meta">${escapeHtml(task.roomName || task.routeHash || '当前座位页')}</div>
             </div>
             <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">取消</button>
@@ -652,7 +660,7 @@
 
   function loginCheckSkipReason() {
     if (state.busy) return '自动任务执行中，暂缓登录检测';
-    if (getVisibleDialog()) return '页面弹窗打开中，暂缓登录检测';
+    if (hasVisibleElement('.el-dialog')) return '页面弹窗打开中，暂缓登录检测';
     const openPicker = Array.from(document.querySelectorAll('.el-picker-panel, .el-select-dropdown.el-popper'))
       .some(visibleElement);
     if (openPicker) return '日期或时间选择器打开中，暂缓登录检测';
@@ -805,7 +813,7 @@
     const seatId = normalizeSeatId(form.seatId);
     if (!seatId) return fail('请填写目标座位号');
     const runAt = normalizeRunAt(form.runAt);
-    if (!runAt) return fail('执行时间格式应为 HH:mm 或 HH:mm:ss');
+    if (!runAt) return fail('请选择有效的执行日期和时间');
     const dayExpr = normalizeDayExpr(form.dayExpr);
     if (!dayExpr) return fail('请选择预约日期');
     const timeRange = normalizeTimeRange(form.timeRange);
@@ -822,9 +830,20 @@
   }
 
   function normalizeRunAt(value) {
-    const match = String(value || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+    const text = String(value || '').trim();
+    let match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[T\s]([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+    if (match) {
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      const date = new Date(year, month - 1, day);
+      if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return '';
+      return `${year}-${pad2(month)}-${pad2(day)}T${pad2(match[4])}:${match[5]}:${match[6] || '00'}`;
+    }
+
+    match = text.match(/^([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
     if (!match) return '';
-    return `${pad2(match[1])}:${match[2]}:${match[3] || '00'}`;
+    return `${toDateText(new Date())}T${pad2(match[1])}:${match[2]}:${match[3] || '00'}`;
   }
 
   function normalizeDayExpr(value) {
@@ -847,11 +866,27 @@
   function schedulerTick() {
     if (state.busy) return;
     const now = new Date();
-    const todayKey = toDateText(now);
+    let changed = false;
+    state.tasks.forEach(task => {
+      if (task.running || task.completedAt || task.missedAt) return;
+      const dueAt = scheduledDateTime(task.runAt);
+      if (!dueAt) return;
+      if (now.getTime() - dueAt.getTime() > RUN_GRACE_MS) {
+        task.missedAt = now.toISOString();
+        task.status = '已错过：超过 10 分钟宽限窗口';
+        changed = true;
+      }
+    });
+    if (changed) {
+      saveTasks();
+      render();
+    }
+
     const dueTask = state.tasks.find(task => {
       if (task.running) return false;
-      if (task.lastRunOn === todayKey) return false;
-      const dueAt = scheduledDateTime(now, task.runAt);
+      if (task.completedAt || task.missedAt) return false;
+      const dueAt = scheduledDateTime(task.runAt);
+      if (!dueAt) return false;
       const diff = now.getTime() - dueAt.getTime();
       return diff >= 0 && diff <= RUN_GRACE_MS;
     });
@@ -871,24 +906,21 @@
 
   function taskCountdownText(task, now) {
     if (task.running) return '倒计时：正在执行';
+    if (task.completedAt) return '倒计时：任务已执行';
+    if (task.missedAt) return '倒计时：任务已错过';
 
-    const todayKey = toDateText(now);
-    const runAt = normalizeRunAt(task.runAt);
+    const runAt = scheduledDateTime(task.runAt);
     if (!runAt) return '倒计时：执行时间无效';
 
-    const todayRunAt = scheduledDateTime(now, runAt);
-    const graceEndsAt = new Date(todayRunAt.getTime() + RUN_GRACE_MS);
-    let nextRunAt = todayRunAt;
-    let prefix = '距离执行';
-
-    if (task.lastRunOn === todayKey || now > graceEndsAt) {
-      nextRunAt = addDays(todayRunAt, 1);
-      prefix = '距离下次执行';
-    } else if (now >= todayRunAt) {
+    const graceEndsAt = new Date(runAt.getTime() + RUN_GRACE_MS);
+    if (now > graceEndsAt) {
+      return '倒计时：已错过';
+    }
+    if (now >= runAt) {
       return '倒计时：已到时间，等待执行';
     }
 
-    return `倒计时：${prefix} ${formatDuration(nextRunAt.getTime() - now.getTime())}`;
+    return `倒计时：距离执行 ${formatDuration(runAt.getTime() - now.getTime())}`;
   }
 
   function formatDuration(ms) {
@@ -908,42 +940,19 @@
   async function runTask(task) {
     state.busy = true;
     task.running = true;
-    task.status = '执行中：准备页面';
+    task.status = '执行中：准备网络预约';
     saveTasks();
     render();
 
     try {
-      if (!isSeatPage()) throw new Error('请先打开立信 IC 空间管理系统的座位预约页面');
-      await ensureRoute(task);
-
-      const targetDate = resolveTargetDate(task.dayExpr);
-      const [startTime, endTime] = task.timeRange.split('-');
-      await setTopDate(targetDate);
-      await setTopTimeRange(startTime, endTime);
-      await waitForSeatMap();
-
-      const seat = findSeat(task.seatId);
-      if (!seat) throw new Error(`当前地点未找到座位 ${task.seatId}`);
-      const status = detectSeatStatus(seat);
-      if (status.key === 'yellow') throw new Error(`座位 ${task.seatId} 当前为使用中`);
-      if (status.key === 'gray') throw new Error(`座位 ${task.seatId} 当前不开放`);
-      if (!['green', 'yellowGreen'].includes(status.key)) throw new Error(`座位 ${task.seatId} 状态未知：${status.label}`);
-
-      task.status = `执行中：选择座位 ${task.seatId}`;
-      saveTasks();
-      render();
-      await clickSeatForSite(seat);
-      await waitForBookingDialog();
-      await setDialogTimeRange(startTime, endTime);
-      fillApplyNote(DEFAULT_APPLY_NOTE);
-      await submitDialog();
-
-      const result = await waitForResultMessage();
+      const result = await reserveSeatByNetwork(task);
+      task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
-      task.status = result || `已提交：${toDateText(new Date())} ${new Date().toLocaleTimeString()}`;
+      task.status = result || `预约成功：${toDateText(new Date())} ${new Date().toLocaleTimeString()}`;
       notify('立信座位助手', task.status);
       toast(task.status);
     } catch (error) {
+      task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
       task.status = `失败：${error.message || error}`;
       notify('立信座位助手', task.status);
@@ -956,170 +965,124 @@
     }
   }
 
-  async function ensureRoute(task) {
-    if (!task.routeHash || task.routeHash === location.hash) return;
-    task.status = `执行中：切换到 ${task.roomName || task.routeHash}`;
+  async function reserveSeatByNetwork(task) {
+    const roomId = getTaskRoomId(task);
+    if (!roomId) throw new Error('任务未记录房间，请在目标房间页面重新创建任务');
+
+    const targetDate = task.targetDate || resolveTargetDate(task.dayExpr);
+    const reserveDate = compactDateText(targetDate);
+    const [startTime, endTime] = task.timeRange.split('-').map(toTimeWithSeconds);
+    if (!startTime || !endTime) throw new Error('预约时间段无效');
+
+    const userInfo = await requestApi(LOGIN_PROBE_FALLBACK_PATH);
+    const user = userInfo.data || {};
+    const accNo = user.accNo;
+    if (!accNo) throw new Error('无法读取当前登录用户');
+
+    task.status = `执行中：查询座位 ${task.seatId}`;
     saveTasks();
     render();
-    location.hash = task.routeHash;
-    await waitFor(() => location.hash === task.routeHash, 10000);
-    await waitForSeatMap();
+
+    const reserveInfo = await requestApi(`/ic-web/reserve?roomIds=${encodeURIComponent(roomId)}&resvDates=${reserveDate}&sysKind=8`, {
+      token: user.token
+    });
+    const device = findReserveDevice(reserveInfo.data, task.seatId);
+    if (!device) throw new Error(`房间 ${roomId} 未找到座位 ${task.seatId}`);
+
+    task.status = `执行中：提交预约 ${task.seatId}`;
+    saveTasks();
+    render();
+
+    const payload = {
+      sysKind: 8,
+      appAccNo: accNo,
+      memberKind: 1,
+      resvMember: [accNo],
+      resvBeginTime: `${targetDate} ${startTime}`,
+      resvEndTime: `${targetDate} ${endTime}`,
+      testName: '',
+      captcha: '',
+      resvProperty: 0,
+      resvDev: [device.devId],
+      memo: DEFAULT_APPLY_NOTE
+    };
+    const result = await requestApi('/ic-web/reserve', {
+      body: JSON.stringify(payload),
+      method: 'POST',
+      token: user.token
+    });
+    const message = result.message || '提交成功';
+    return `预约成功：${task.seatId} ${targetDate} ${startTime.slice(0, 5)}-${endTime.slice(0, 5)}（${message}）`;
   }
 
-  function isSeatPage() {
-    return location.hostname === 'kjyy.lixin.edu.cn' && location.hash.includes('/ic/seatPredetermine/');
-  }
+  async function requestApi(url, options = {}) {
+    const page = getPageWindow();
+    const pageFetch = page?.fetch?.bind(page) || fetch;
+    const headers = {
+      accept: 'application/json, text/plain, */*',
+      ...options.headers
+    };
+    if (options.method === 'POST' || options.body) {
+      headers['content-type'] = 'application/json;charset=UTF-8';
+    }
+    if (options.token) {
+      headers.token = options.token;
+    }
+    headers.lan = '1';
 
-  async function setTopDate(dateText) {
-    const input = document.querySelector('.seatOperation input[placeholder="请选择"]');
-    if (!input) throw new Error('未找到日期选择框');
-    if (input.value === dateText) return;
-
-    await chooseDateWithPicker(input, dateText);
-    await waitFor(() => input.value === dateText, 5000);
-    if (input.value !== dateText) throw new Error(`日期 ${dateText} 未选择成功`);
-    await sleep(800);
-  }
-
-  async function chooseDateWithPicker(input, dateText) {
-    input.click();
-    const panel = await waitForElement('.el-picker-panel.el-date-picker', 3000, visibleElement);
-    if (!panel) throw new Error('日期面板未打开');
-    const target = parseDateText(dateText);
-
-    for (let i = 0; i < 24; i++) {
-      const current = getPickerYearMonth(panel);
-      if (!current) break;
-      const diff = (target.year - current.year) * 12 + (target.month - current.month);
-      if (diff === 0) break;
-      const selector = diff > 0 ? '.el-date-picker__next-btn.el-icon-arrow-right' : '.el-date-picker__prev-btn.el-icon-arrow-left';
-      const btn = panel.querySelector(selector);
-      if (!btn) break;
-      btn.click();
-      await sleep(180);
+    let response;
+    try {
+      response = await pageFetch(url, {
+        body: options.body,
+        cache: 'no-store',
+        credentials: 'include',
+        headers,
+        method: options.method || 'GET',
+        redirect: 'manual'
+      });
+    } catch (error) {
+      throw new Error(`网络请求失败：${error.message || error}`);
     }
 
-    const day = String(target.day);
-    const cell = Array.from(panel.querySelectorAll('td.available:not(.disabled)'))
-      .find(td => textOf(td) === day && !td.className.includes('prev-month') && !td.className.includes('next-month'));
-    if (!cell) throw new Error(`日期 ${dateText} 不可选`);
-    cell.click();
+    if (response.type === 'opaqueredirect' || response.status === 0) {
+      throw new Error('登录可能已失效：请求被重定向到统一认证');
+    }
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error(`登录可能已失效：接口发生重定向（HTTP ${response.status}）`);
+    }
+    if (!response.ok) {
+      throw new Error(`接口请求失败（HTTP ${response.status}）`);
+    }
+
+    const text = await response.text().catch(() => '');
+    const data = parseJson(text);
+    if (!data) throw new Error('接口返回不是 JSON');
+    if (data.code !== undefined && data.code !== 0 && data.code !== '0') {
+      throw new Error(data.message || data.msg || `接口返回错误：${data.code}`);
+    }
+    return data;
   }
 
-  function getPickerYearMonth(panel) {
-    const text = textOf(panel.querySelector('.el-date-picker__header') || panel);
-    const match = text.match(/(\d{4})\s*年\s*(\d{1,2})\s*月/);
-    if (!match) return null;
-    return { year: Number(match[1]), month: Number(match[2]) };
+  function getTaskRoomId(task) {
+    return extractRoomId(task.routeHash) || getCurrentRoomId();
   }
 
-  async function setTopTimeRange(start, end) {
-    const inputs = Array.from(document.querySelectorAll('.seatOperation input'));
-    const startInput = inputs.find(input => input.getAttribute('placeholder') === '请选择开始时间');
-    const endInput = inputs.find(input => input.getAttribute('placeholder') === '请选择结束时间');
-    if (!startInput || !endInput) throw new Error('未找到顶部时间选择框');
-    if (startInput.value !== start) await chooseSelectOption(startInput, start);
-    if (endInput.value !== end) await chooseSelectOption(endInput, end);
-    await sleep(800);
+  function extractRoomId(hash) {
+    const match = String(hash || '').match(/\/ic\/seatPredetermine\/(\d+)/);
+    return match ? match[1] : '';
   }
 
-  async function setDialogTimeRange(start, end) {
-    const dialog = getVisibleDialog();
-    if (!dialog) throw new Error('预约弹窗已消失');
-    const inputs = Array.from(dialog.querySelectorAll('input[placeholder="请选择"]'));
-    if (inputs.length < 2) throw new Error('未找到预约弹窗时间选择框');
-    if (inputs[0].value !== start) await chooseSelectOption(inputs[0], start);
-    if (inputs[1].value !== end) await chooseSelectOption(inputs[1], end);
-  }
-
-  async function chooseSelectOption(input, value) {
-    input.click();
-    const dropdown = await waitForElement('.el-select-dropdown.el-popper', 3000, visibleElement);
-    if (!dropdown) throw new Error(`时间选择框未打开：${value}`);
-    const option = await waitFor(() => {
-      const visibleDropdown = Array.from(document.querySelectorAll('.el-select-dropdown.el-popper')).find(visibleElement);
-      if (!visibleDropdown) return null;
-      return Array.from(visibleDropdown.querySelectorAll('.el-select-dropdown__item, li'))
-        .find(item => textOf(item) === value && !item.classList.contains('is-disabled') && !item.classList.contains('disabled'));
-    }, 3000);
-    if (!option) throw new Error(`时间 ${value} 不可选`);
-    option.scrollIntoView({ block: 'center' });
-    await sleep(80);
-    option.click();
-    await waitFor(() => input.value === value, 3000);
-    if (input.value !== value) throw new Error(`时间 ${value} 未选择成功`);
-  }
-
-  function findSeat(seatId) {
-    return Array.from(document.querySelectorAll('.seat-area .grid .draggable[title]'))
-      .find(el => normalizeSeatId(el.getAttribute('title') || el.textContent) === normalizeSeatId(seatId));
+  function findReserveDevice(devices, seatId) {
+    const normalizedSeatId = normalizeSeatId(seatId);
+    return Array.isArray(devices)
+      ? devices.find(device => normalizeSeatId(device.devName || device.name) === normalizedSeatId) || null
+      : null;
   }
 
   function detectSeatStatus(seat) {
     const classes = Array.from(seat.classList);
     const key = classes.find(cls => STATUS_LABELS[cls]) || 'unknown';
     return { key, label: STATUS_LABELS[key] || classes.join(' ') || '未知' };
-  }
-
-  async function clickSeatForSite(seat) {
-    state.automationClicking = true;
-    try {
-      seat.scrollIntoView({ block: 'center', inline: 'center' });
-      await sleep(150);
-      seat.click();
-    } finally {
-      setTimeout(() => {
-        state.automationClicking = false;
-      }, 200);
-    }
-  }
-
-  async function waitForBookingDialog() {
-    const dialog = await waitFor(() => {
-      const dialog = getVisibleDialog();
-      return dialog && textOf(dialog).includes('申请预约') ? dialog : null;
-    }, 5000);
-    if (!dialog) throw new Error('预约弹窗未打开');
-    return dialog;
-  }
-
-  function getVisibleDialog() {
-    return Array.from(document.querySelectorAll('.el-dialog')).find(visibleElement);
-  }
-
-  function fillApplyNote(value) {
-    const dialog = getVisibleDialog();
-    if (!dialog) return;
-    const textarea = dialog.querySelector('textarea');
-    if (!textarea) return;
-    setNativeValue(textarea, value || '');
-  }
-
-  async function submitDialog() {
-    const dialog = getVisibleDialog();
-    if (!dialog) throw new Error('预约弹窗已消失');
-    const button = Array.from(dialog.querySelectorAll('button')).find(btn => textOf(btn) === '提交');
-    if (!button) throw new Error('未找到提交按钮');
-    button.click();
-  }
-
-  async function waitForResultMessage() {
-    const started = Date.now();
-    while (Date.now() - started < 8000) {
-      const message = Array.from(document.querySelectorAll('.el-message, .el-notification, .el-message-box'))
-        .filter(visibleElement)
-        .map(el => textOf(el))
-        .filter(Boolean)
-        .pop();
-      if (message) return message;
-      await sleep(250);
-    }
-    return '已点击提交，请在页面确认结果';
-  }
-
-  async function waitForSeatMap() {
-    const seat = await waitForElement('.seat-area .grid .draggable[title]', 10000);
-    if (!seat) throw new Error('座位图未加载完成');
   }
 
   function resolveTargetDate(expr) {
@@ -1140,6 +1103,12 @@
     return dayOptions().find(option => option.value === expr)?.label || expr || '';
   }
 
+  function formatTargetDateLabel(task) {
+    return task.targetDate
+      ? `预约：${task.targetDate}`
+      : dayLabel(task.dayExpr);
+  }
+
   function dayOptionByValue(value) {
     return DAY_OPTION_DEFINITIONS.find(option => option.value === value) || null;
   }
@@ -1152,14 +1121,64 @@
     return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
   }
 
-  function scheduledDateTime(now, runAt) {
-    const [h, m, s] = runAt.split(':').map(Number);
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, s || 0, 0);
+  function scheduledDateTime(runAt) {
+    const parts = parseDateTimeText(normalizeRunAt(runAt));
+    if (!parts) return null;
+    return new Date(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
   }
 
-  function parseDateText(text) {
-    const [year, month, day] = text.split('-').map(Number);
-    return { year, month, day };
+  function formatRunAtLabel(runAt) {
+    const date = scheduledDateTime(runAt);
+    if (!date) return '执行时间无效';
+    return `执行：${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  }
+
+  function defaultRunAt() {
+    return `${toDateText(new Date())}T22:30:00`;
+  }
+
+  function compactDateText(dateText) {
+    const match = String(dateText || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return match ? `${match[1]}${match[2]}${match[3]}` : '';
+  }
+
+  function normalizeDateText(value) {
+    const match = String(value || '').trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (!match) return '';
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(year, month - 1, day);
+    return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day
+      ? toDateText(date)
+      : '';
+  }
+
+  function toTimeWithSeconds(value) {
+    const match = String(value || '').match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+    return match ? `${pad2(match[1])}:${match[2]}:00` : '';
+  }
+
+  function parseDateTimeText(value) {
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)$/);
+    if (!match) return null;
+    const parts = {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+      hour: Number(match[4]),
+      minute: Number(match[5]),
+      second: Number(match[6])
+    };
+    const date = new Date(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
+    return date.getFullYear() === parts.year &&
+      date.getMonth() === parts.month - 1 &&
+      date.getDate() === parts.day &&
+      date.getHours() === parts.hour &&
+      date.getMinutes() === parts.minute &&
+      date.getSeconds() === parts.second
+      ? parts
+      : null;
   }
 
   function startOfDay(date) {
@@ -1179,14 +1198,8 @@
     return String(value).padStart(2, '0');
   }
 
-  function setNativeValue(element, value) {
-    const prototype = element instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
-    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
-    descriptor.set.call(element, value);
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+  function hasVisibleElement(selector) {
+    return Array.from(document.querySelectorAll(selector)).some(visibleElement);
   }
 
   function visibleElement(element) {
@@ -1200,27 +1213,6 @@
     return (element && (element.innerText || element.textContent) || '').replace(/\s+/g, ' ').trim();
   }
 
-  async function waitForElement(selector, timeoutMs, predicate = Boolean) {
-    return waitFor(() => {
-      const elements = Array.from(document.querySelectorAll(selector));
-      return elements.find(predicate) || null;
-    }, timeoutMs);
-  }
-
-  async function waitFor(getter, timeoutMs) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      const result = getter();
-      if (result) return result;
-      await sleep(100);
-    }
-    return null;
-  }
-
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
   function getRoomName() {
     const h3 = document.querySelector('.ql-editor h3, h3');
     return textOf(h3).replace(/\([^)]*\)/g, '').trim();
@@ -1232,9 +1224,14 @@
       if (!Array.isArray(tasks)) return [];
       return tasks.map(task => ({
         ...task,
-        runAt: task.runAt === '07:59:59' ? '22:30:00' : (normalizeRunAt(task.runAt) || '22:30:00'),
+        runAt: task.runAt === '07:59:59' ? defaultRunAt() : (normalizeRunAt(task.runAt) || defaultRunAt()),
         dayExpr: isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天',
-        timeRange: normalizeTimeRange(task.timeRange) || '08:00-22:30'
+        targetDate: normalizeDateText(task.targetDate) || resolveTargetDate(isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天'),
+        timeRange: normalizeTimeRange(task.timeRange) || '08:00-22:30',
+        completedAt: task.completedAt || '',
+        missedAt: task.missedAt || '',
+        running: false,
+        status: task.status || '等待执行'
       }));
     } catch {
       return [];
@@ -1248,7 +1245,7 @@
   function loadForm() {
     const fallback = {
       seatId: '',
-      runAt: '22:30:00',
+      runAt: defaultRunAt(),
       dayExpr: '明天',
       timeRange: '08:00-22:30',
       routeHash: location.hash,
@@ -1256,7 +1253,9 @@
     };
     try {
       const saved = { ...fallback, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
-      if (saved.runAt === '07:59:59') saved.runAt = '22:30:00';
+      saved.runAt = saved.runAt === '07:59:59'
+        ? defaultRunAt()
+        : (normalizeRunAt(saved.runAt) || defaultRunAt());
       if (!isValidDayExpr(saved.dayExpr)) saved.dayExpr = '明天';
       saved.timeRange = normalizeTimeRange(saved.timeRange) || '08:00-22:30';
       return saved;
