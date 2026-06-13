@@ -22,6 +22,9 @@
   const LOGIN_PROBE_FALLBACK_PATH = '/ic-web/auth/userInfo';
   const LOGIN_RESPONSE_PREVIEW_LIMIT = 3000;
   const DEFAULT_APPLY_NOTE = '';
+  const DEFAULT_RUN_TIME = '22:30:00';
+  const DEFAULT_TIME_RANGE = '08:00-22:30';
+  const LEGACY_RUN_TIME = '07:59:59';
   const DAY_OPTION_DEFINITIONS = [
     { value: '今天', offset: 0, name: '今天' },
     { value: '明天', offset: 1, name: '明天' },
@@ -66,11 +69,7 @@
     render();
     setInterval(appTick, TICK_MS);
     window.addEventListener('hashchange', () => {
-      if (getCurrentRoomId()) {
-        state.form.routeHash = location.hash;
-        state.form.roomName = getRoomName();
-        saveForm();
-      }
+      if (refreshCurrentRoomRecord()) saveForm();
       render();
     });
   }
@@ -232,6 +231,32 @@
         font-size: 12px;
         font-weight: 600;
       }
+      .lsh-label-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-height: 18px;
+      }
+      .lsh-mini-actions {
+        display: flex;
+        flex: 0 0 auto;
+        gap: 5px;
+      }
+      .lsh-mini-button {
+        height: 22px;
+        border: 1px solid #cbd5e1;
+        border-radius: 5px;
+        background: #fff;
+        color: #146c94;
+        cursor: pointer;
+        font-size: 12px;
+        line-height: 20px;
+      }
+      .lsh-mini-button:hover {
+        background: #f0f9ff;
+        border-color: #7dd3fc;
+      }
       .lsh-field input,
       .lsh-field select {
         height: 34px;
@@ -252,6 +277,14 @@
       .lsh-field input[readonly] {
         color: #64748b;
         background: #f8fafc;
+      }
+      .lsh-target-room {
+        grid-column: 1 / -1;
+        margin-top: -2px;
+        color: #64748b;
+        font-size: 12px;
+        line-height: 1.45;
+        word-break: break-word;
       }
       .lsh-primary {
         width: 100%;
@@ -397,17 +430,29 @@
               <label>目标座位号</label>
               <input data-lsh-field="seatId" autocomplete="off" placeholder="例如 PDW3FA3001">
             </div>
+            <div class="lsh-target-room" data-lsh-target-room></div>
             <div class="lsh-field">
-              <label>几点开始执行预约</label>
-              <input data-lsh-field="runAt" type="datetime-local" step="1" autocomplete="off">
+              <div class="lsh-label-row">
+                <label>几点开始执行预约</label>
+                <div class="lsh-mini-actions">
+                  <button class="lsh-mini-button" type="button" data-lsh-run-now>现在</button>
+                  <button class="lsh-mini-button" type="button" data-lsh-run-default>默认</button>
+                </div>
+              </div>
+              <input data-lsh-field="runAt" autocomplete="off" placeholder="YYYY-MM-DD HH:mm:ss">
             </div>
             <div class="lsh-field">
               <label>预约哪一天</label>
               <select data-lsh-field="dayExpr"></select>
             </div>
             <div class="lsh-field lsh-field-wide">
-              <label>预约时间段</label>
-              <input data-lsh-field="timeRange" autocomplete="off" placeholder="例如 08:00-22:30">
+              <div class="lsh-label-row">
+                <label>预约时间段</label>
+                <div class="lsh-mini-actions">
+                  <button class="lsh-mini-button" type="button" data-lsh-time-reset>重置</button>
+                </div>
+              </div>
+              <input data-lsh-field="timeRange" autocomplete="off" placeholder="例如 ${DEFAULT_TIME_RANGE}">
             </div>
           </div>
           <button class="lsh-primary" type="button">提交任务</button>
@@ -434,6 +479,10 @@
     dom.loginStatus = root.querySelector('[data-lsh-login-status]');
     dom.loginLabel = root.querySelector('[data-lsh-login-label]');
     dom.loginDetail = root.querySelector('[data-lsh-login-detail]');
+    dom.targetRoom = root.querySelector('[data-lsh-target-room]');
+    dom.runNow = root.querySelector('[data-lsh-run-now]');
+    dom.runDefault = root.querySelector('[data-lsh-run-default]');
+    dom.timeReset = root.querySelector('[data-lsh-time-reset]');
     dom.fields = {
       seatId: root.querySelector('[data-lsh-field="seatId"]'),
       runAt: root.querySelector('[data-lsh-field="runAt"]'),
@@ -444,15 +493,12 @@
     dom.fab.addEventListener('click', () => togglePanel(true));
     dom.close.addEventListener('click', () => togglePanel(false));
     dom.submit.addEventListener('click', createTaskFromForm);
+    dom.runNow.addEventListener('click', () => setFieldValue('runAt', formatDateTimeInput(new Date())));
+    dom.runDefault.addEventListener('click', () => setFieldValue('runAt', formatRunAtInput(defaultRunAt())));
+    dom.timeReset.addEventListener('click', () => setFieldValue('timeRange', DEFAULT_TIME_RANGE));
     Object.values(dom.fields).forEach(field => {
-      const update = () => {
-        state.form[field.dataset.lshField] = field.value;
-        state.form.routeHash = location.hash;
-        state.form.roomName = getRoomName();
-        saveForm();
-      };
-      field.addEventListener('input', update);
-      field.addEventListener('change', update);
+      field.addEventListener('input', () => syncFieldToForm(field));
+      field.addEventListener('change', () => syncFieldToForm(field));
     });
     dom.taskList.addEventListener('click', event => {
       const button = event.target.closest('[data-lsh-cancel]');
@@ -463,6 +509,53 @@
       render();
       toast('已取消任务');
     });
+  }
+
+  function syncFieldToForm(field) {
+    state.form[field.dataset.lshField] = field.value;
+    refreshCurrentRoomRecord();
+    saveForm();
+  }
+
+  function setFieldValue(key, value) {
+    const field = dom.fields[key];
+    if (!field) return;
+    field.value = value;
+    syncFieldToForm(field);
+    render();
+  }
+
+  function refreshCurrentRoomRecord() {
+    return saveRoomSnapshot(getCurrentRoomSnapshot());
+  }
+
+  function getCurrentRoomSnapshot() {
+    const roomId = getCurrentRoomId();
+    if (!roomId) return null;
+    const roomName = getRoomName() || (state.form.routeHash === location.hash ? state.form.roomName : '');
+    return { roomId, routeHash: location.hash, roomName };
+  }
+
+  function getFormRoomSnapshot() {
+    const roomId = extractRoomId(state.form.routeHash);
+    return roomId
+      ? { roomId, routeHash: state.form.routeHash, roomName: state.form.roomName || '' }
+      : null;
+  }
+
+  function getPreferredRoomSnapshot() {
+    return getCurrentRoomSnapshot() || getFormRoomSnapshot();
+  }
+
+  function saveRoomSnapshot(snapshot) {
+    if (!snapshot) return false;
+    const isSameRoute = state.form.routeHash === snapshot.routeHash;
+    const nextRoomName = snapshot.roomName || (isSameRoute ? state.form.roomName : '');
+    const changed = state.form.routeHash !== snapshot.routeHash ||
+      state.form.roomName !== nextRoomName;
+    state.form.routeHash = snapshot.routeHash;
+    state.form.roomName = nextRoomName;
+    return changed;
   }
 
   function bindSeatPicker() {
@@ -483,8 +576,7 @@
 
   function handleSeatPick(seatId, status) {
     state.form.seatId = seatId;
-    state.form.routeHash = location.hash;
-    state.form.roomName = getRoomName();
+    refreshCurrentRoomRecord();
     saveForm();
     render();
     togglePanel(true);
@@ -499,9 +591,8 @@
       return;
     }
 
-    const routeHash = getCurrentRoomId() ? location.hash : state.form.routeHash;
-    const roomName = getCurrentRoomId() ? getRoomName() : state.form.roomName;
-    if (!extractRoomId(routeHash)) {
+    const room = getPreferredRoomSnapshot();
+    if (!room) {
       toast('请先在目标座位预约房间页面创建任务或点选座位');
       return;
     }
@@ -512,8 +603,8 @@
       dayExpr: parsed.dayExpr,
       targetDate: resolveTargetDate(parsed.dayExpr),
       timeRange: parsed.timeRange,
-      routeHash,
-      roomName,
+      routeHash: room.routeHash,
+      roomName: room.roomName,
       createdAt: new Date().toISOString(),
       lastRunOn: '',
       completedAt: '',
@@ -529,7 +620,7 @@
       dayExpr: parsed.dayExpr,
       timeRange: parsed.timeRange,
       routeHash: task.routeHash,
-      roomName
+      roomName: task.roomName
     };
     saveForm();
     saveTasks();
@@ -539,6 +630,7 @@
 
   function render() {
     if (!dom.panel) return;
+    if (refreshCurrentRoomRecord()) saveForm();
     if (!isValidDayExpr(state.form.dayExpr)) {
       state.form.dayExpr = '明天';
       saveForm();
@@ -551,10 +643,11 @@
     dom.room.textContent = currentRoom
       ? `当前页面：${currentRoom} (${location.hash || '未进入座位预约页'})`
       : `当前页面：${location.hash || '未进入座位预约页'}`;
+    dom.targetRoom.textContent = targetRoomLabel();
     renderLoginCheck();
 
     for (const [key, input] of Object.entries(dom.fields)) {
-      if (document.activeElement !== input) input.value = state.form[key] || '';
+      if (document.activeElement !== input) input.value = fieldDisplayValue(key, state.form[key]);
     }
 
     dom.count.textContent = `${state.tasks.length}`;
@@ -569,7 +662,7 @@
           <div class="lsh-task-top">
             <div>
               <div class="lsh-task-seat">${escapeHtml(task.seatId)}</div>
-              <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || '08:00-22:30')}</div>
+              <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || DEFAULT_TIME_RANGE)}</div>
               <div class="lsh-task-meta">${escapeHtml(task.roomName || task.routeHash || '当前座位页')}</div>
             </div>
             <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">取消</button>
@@ -580,6 +673,20 @@
       `)
       .join('');
     updateTaskCountdowns();
+  }
+
+  function fieldDisplayValue(key, value) {
+    return key === 'runAt'
+      ? formatRunAtInput(value)
+      : (value || '');
+  }
+
+  function targetRoomLabel() {
+    const roomId = extractRoomId(state.form.routeHash);
+    const room = state.form.roomName || '';
+    if (roomId && room) return `目标房间：${room} (${state.form.routeHash})`;
+    if (roomId) return `目标房间：${state.form.routeHash}`;
+    return '目标房间：未记录，请先进入目标房间页或左键点选座位';
   }
 
   function appTick() {
@@ -817,7 +924,7 @@
     const dayExpr = normalizeDayExpr(form.dayExpr);
     if (!dayExpr) return fail('请选择预约日期');
     const timeRange = normalizeTimeRange(form.timeRange);
-    if (!timeRange) return fail('预约时间段格式应为 HH:mm-HH:mm，例如 08:00-22:30');
+    if (!timeRange) return fail(`预约时间段格式应为 HH:mm-HH:mm，例如 ${DEFAULT_TIME_RANGE}`);
     return { ok: true, seatId, runAt, dayExpr, timeRange };
   }
 
@@ -1130,11 +1237,20 @@
   function formatRunAtLabel(runAt) {
     const date = scheduledDateTime(runAt);
     if (!date) return '执行时间无效';
-    return `执行：${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+    return `执行：${formatDateTimeInput(date)}`;
+  }
+
+  function formatRunAtInput(value) {
+    const date = scheduledDateTime(value);
+    return date ? formatDateTimeInput(date) : (value || '');
+  }
+
+  function formatDateTimeInput(date) {
+    return `${toDateText(date)} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
   }
 
   function defaultRunAt() {
-    return `${toDateText(new Date())}T22:30:00`;
+    return `${toDateText(new Date())}T${DEFAULT_RUN_TIME}`;
   }
 
   function compactDateText(dateText) {
@@ -1224,10 +1340,10 @@
       if (!Array.isArray(tasks)) return [];
       return tasks.map(task => ({
         ...task,
-        runAt: task.runAt === '07:59:59' ? defaultRunAt() : (normalizeRunAt(task.runAt) || defaultRunAt()),
+        runAt: task.runAt === LEGACY_RUN_TIME ? defaultRunAt() : (normalizeRunAt(task.runAt) || defaultRunAt()),
         dayExpr: isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天',
         targetDate: normalizeDateText(task.targetDate) || resolveTargetDate(isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天'),
-        timeRange: normalizeTimeRange(task.timeRange) || '08:00-22:30',
+        timeRange: normalizeTimeRange(task.timeRange) || DEFAULT_TIME_RANGE,
         completedAt: task.completedAt || '',
         missedAt: task.missedAt || '',
         running: false,
@@ -1247,17 +1363,17 @@
       seatId: '',
       runAt: defaultRunAt(),
       dayExpr: '明天',
-      timeRange: '08:00-22:30',
+      timeRange: DEFAULT_TIME_RANGE,
       routeHash: location.hash,
       roomName: ''
     };
     try {
       const saved = { ...fallback, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
-      saved.runAt = saved.runAt === '07:59:59'
+      saved.runAt = saved.runAt === LEGACY_RUN_TIME
         ? defaultRunAt()
         : (normalizeRunAt(saved.runAt) || defaultRunAt());
       if (!isValidDayExpr(saved.dayExpr)) saved.dayExpr = '明天';
-      saved.timeRange = normalizeTimeRange(saved.timeRange) || '08:00-22:30';
+      saved.timeRange = normalizeTimeRange(saved.timeRange) || DEFAULT_TIME_RANGE;
       return saved;
     } catch {
       return fallback;
