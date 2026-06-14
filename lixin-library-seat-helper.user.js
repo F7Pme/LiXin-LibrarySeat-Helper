@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LiXin Library Seat Helper
 // @namespace    https://kjyy.lixin.edu.cn/
-// @version      2.0.0
+// @version      3.0.0
 // @description  上海立信会计金融学院 IC 空间座位预约辅助：点座位自动填号、定时预约、任务列表与取消。
 // @author       顾佳俊
 // @match        https://kjyy.lixin.edu.cn/*
@@ -22,6 +22,10 @@
   const RESERVATION_REFRESH_INTERVAL_MS = 30 * 1000;
   const RESERVATION_LOOKAHEAD_DAYS = 7;
   const RESERVATION_PAGE_SIZE = 20;
+  const CONTINUOUS_REQUEST_ATTEMPTS = 6;
+  const CONTINUOUS_REQUEST_INTERVAL_MS = 1000;
+  const RESERVATION_PREPARE_LEAD_MS = 30 * 1000;
+  const API_REQUEST_TIMEOUT_MS = 5 * 1000;
   const LOGIN_PROBE_FALLBACK_PATH = '/ic-web/auth/userInfo';
   const LOGIN_RESPONSE_PREVIEW_LIMIT = 3000;
   const DEFAULT_APPLY_NOTE = '';
@@ -50,7 +54,6 @@
     tasks: loadTasks(),
     form: loadForm(),
     panelOpen: false,
-    busy: false,
     loginCheck: {
       status: 'pending',
       message: '等待首次检测',
@@ -69,6 +72,7 @@
   };
 
   const dom = {};
+  const preparedRequests = new Map();
 
   boot();
 
@@ -241,6 +245,28 @@
         font-size: 12px;
         font-weight: 600;
       }
+      .lsh-field-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .lsh-check {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: #475569;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        white-space: nowrap;
+      }
+      .lsh-check input[type="checkbox"] {
+        width: 14px;
+        height: 14px;
+        margin: 0;
+        accent-color: #146c94;
+      }
       .lsh-input-wrap {
         position: relative;
       }
@@ -251,7 +277,7 @@
         --lsh-input-action-space: 92px;
       }
       .lsh-range-input {
-        --lsh-input-action-space: 52px;
+        --lsh-input-action-space: 92px;
       }
       .lsh-input-actions {
         position: absolute;
@@ -278,7 +304,7 @@
         background: #f0f9ff;
         border-color: #7dd3fc;
       }
-      .lsh-field input,
+      .lsh-field input:not([type="checkbox"]),
       .lsh-field select {
         height: 34px;
         width: 100%;
@@ -290,12 +316,12 @@
         font-size: 13px;
         outline: none;
       }
-      .lsh-field input:focus,
+      .lsh-field input:not([type="checkbox"]):focus,
       .lsh-field select:focus {
         border-color: #146c94;
         box-shadow: 0 0 0 3px rgba(20, 108, 148, .12);
       }
-      .lsh-field input[readonly] {
+      .lsh-field input:not([type="checkbox"])[readonly] {
         color: #64748b;
         background: #f8fafc;
       }
@@ -459,7 +485,13 @@
             </div>
             <div class="lsh-target-room" data-lsh-target-room></div>
             <div class="lsh-field lsh-field-wide">
-              <label>几点开始执行预约</label>
+              <div class="lsh-field-head">
+                <label>几点开始执行预约</label>
+                <label class="lsh-check">
+                  <input type="checkbox" data-lsh-field="continuousRequest">
+                  <span>连续请求</span>
+                </label>
+              </div>
               <div class="lsh-input-wrap lsh-run-input">
                 <input data-lsh-field="runAt" autocomplete="off" placeholder="YYYY-MM-DD HH:mm:ss">
                 <div class="lsh-input-actions">
@@ -477,7 +509,8 @@
               <div class="lsh-input-wrap lsh-range-input">
                 <input data-lsh-field="timeRange" autocomplete="off" placeholder="例如 ${DEFAULT_TIME_RANGE}">
                 <div class="lsh-input-actions">
-                  <button class="lsh-input-button" type="button" data-lsh-time-reset>重置</button>
+                  <button class="lsh-input-button" type="button" data-lsh-time-now>现在</button>
+                  <button class="lsh-input-button" type="button" data-lsh-time-default>默认</button>
                 </div>
               </div>
             </div>
@@ -516,10 +549,12 @@
     dom.targetRoom = root.querySelector('[data-lsh-target-room]');
     dom.runNow = root.querySelector('[data-lsh-run-now]');
     dom.runDefault = root.querySelector('[data-lsh-run-default]');
-    dom.timeReset = root.querySelector('[data-lsh-time-reset]');
+    dom.timeNow = root.querySelector('[data-lsh-time-now]');
+    dom.timeDefault = root.querySelector('[data-lsh-time-default]');
     dom.fields = {
       seatId: root.querySelector('[data-lsh-field="seatId"]'),
       runAt: root.querySelector('[data-lsh-field="runAt"]'),
+      continuousRequest: root.querySelector('[data-lsh-field="continuousRequest"]'),
       dayExpr: root.querySelector('[data-lsh-field="dayExpr"]'),
       timeRange: root.querySelector('[data-lsh-field="timeRange"]')
     };
@@ -529,7 +564,8 @@
     dom.submit.addEventListener('click', createTaskFromForm);
     dom.runNow.addEventListener('click', () => setFieldValue('runAt', formatDateTimeInput(new Date())));
     dom.runDefault.addEventListener('click', () => setFieldValue('runAt', formatRunAtInput(defaultRunAt())));
-    dom.timeReset.addEventListener('click', () => setFieldValue('timeRange', DEFAULT_TIME_RANGE));
+    dom.timeNow.addEventListener('click', () => setFieldValue('timeRange', timeRangeWithCurrentStart()));
+    dom.timeDefault.addEventListener('click', () => setFieldValue('timeRange', DEFAULT_TIME_RANGE));
     Object.values(dom.fields).forEach(field => {
       field.addEventListener('input', () => syncFieldToForm(field));
       field.addEventListener('change', () => syncFieldToForm(field));
@@ -544,6 +580,7 @@
       if (!button) return;
       const id = button.getAttribute('data-lsh-cancel');
       state.tasks = state.tasks.filter(task => task.id !== id);
+      preparedRequests.delete(id);
       saveTasks();
       render();
       toast('已取消任务');
@@ -551,9 +588,13 @@
   }
 
   function syncFieldToForm(field) {
-    state.form[field.dataset.lshField] = field.value;
+    state.form[field.dataset.lshField] = readFieldValue(field);
     refreshCurrentRoomRecord();
     saveForm();
+  }
+
+  function readFieldValue(field) {
+    return field.type === 'checkbox' ? field.checked : field.value;
   }
 
   function setFieldValue(key, value) {
@@ -562,6 +603,12 @@
     field.value = value;
     syncFieldToForm(field);
     render();
+  }
+
+  function timeRangeWithCurrentStart() {
+    const current = normalizeTimeRange(dom.fields.timeRange.value);
+    const end = current ? current.split('-')[1] : DEFAULT_TIME_RANGE.split('-')[1];
+    return `${formatTimeInput(new Date())}-${end}`;
   }
 
   function refreshCurrentRoomRecord() {
@@ -639,6 +686,7 @@
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       seatId: parsed.seatId,
       runAt: parsed.runAt,
+      continuousRequest: parsed.continuousRequest,
       dayExpr: parsed.dayExpr,
       targetDate: resolveTargetDate(parsed.dayExpr),
       timeRange: parsed.timeRange,
@@ -656,6 +704,7 @@
       ...state.form,
       seatId: parsed.seatId,
       runAt: parsed.runAt,
+      continuousRequest: parsed.continuousRequest,
       dayExpr: parsed.dayExpr,
       timeRange: parsed.timeRange,
       routeHash: task.routeHash,
@@ -687,7 +736,11 @@
     renderReservations();
 
     for (const [key, input] of Object.entries(dom.fields)) {
-      if (document.activeElement !== input) input.value = fieldDisplayValue(key, state.form[key]);
+      if (input.type === 'checkbox') {
+        input.checked = Boolean(state.form[key]);
+      } else if (document.activeElement !== input) {
+        input.value = fieldDisplayValue(key, state.form[key]);
+      }
     }
 
     dom.count.textContent = `${state.tasks.length}`;
@@ -702,7 +755,7 @@
           <div class="lsh-task-top">
             <div>
               <div class="lsh-task-seat">${escapeHtml(task.seatId)}</div>
-              <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || DEFAULT_TIME_RANGE)}</div>
+              <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || DEFAULT_TIME_RANGE)} / ${escapeHtml(continuousRequestLabel(task))}</div>
               <div class="lsh-task-meta">${escapeHtml(task.roomName || task.routeHash || '当前座位页')}</div>
             </div>
             <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">取消</button>
@@ -1020,7 +1073,6 @@
   }
 
   function loginCheckSkipReason() {
-    if (state.busy) return '自动任务执行中，暂缓登录检测';
     if (hasVisibleElement('.el-dialog')) return '页面弹窗打开中，暂缓登录检测';
     const openPicker = Array.from(document.querySelectorAll('.el-picker-panel, .el-select-dropdown.el-popper'))
       .some(visibleElement);
@@ -1034,9 +1086,12 @@
 
   async function runLoginProbe(probe) {
     const started = Date.now();
+    const page = getPageWindow();
+    const pageFetch = page?.fetch?.bind(page) || fetch;
+    const Controller = page?.AbortController || AbortController;
+    const controller = new Controller();
+    const timeoutId = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
     try {
-      const page = getPageWindow();
-      const pageFetch = page?.fetch?.bind(page) || fetch;
       const response = await pageFetch(probe.url, {
         cache: 'no-store',
         credentials: 'include',
@@ -1045,11 +1100,20 @@
           accept: 'application/json, text/plain, */*',
           'x-lixin-seat-helper-probe': '1'
         },
-        method: 'GET'
+        method: 'GET',
+        signal: controller.signal
       });
-      const responseText = response.type === 'opaqueredirect'
-        ? ''
-        : await response.clone().text().catch(() => '');
+      let responseText = '';
+      if (response.type !== 'opaqueredirect') {
+        try {
+          responseText = await response.clone().text();
+        } catch (error) {
+          if (error?.name === 'AbortError') {
+            return { status: 'failed', message: `网络检测请求超时：${Math.round(API_REQUEST_TIMEOUT_MS / 1000)} 秒内未收到完整响应` };
+          }
+          responseText = '';
+        }
+      }
       const record = {
         contentType: response.headers.get('content-type') || '',
         json: parseJson(responseText),
@@ -1069,7 +1133,12 @@
       }
       return { status: 'warn', message: `网络响应无法确认：${probe.label}，HTTP ${response.status}` };
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        return { status: 'failed', message: `网络检测请求超时：${Math.round(API_REQUEST_TIMEOUT_MS / 1000)} 秒内未收到响应` };
+      }
       return { status: 'failed', message: `网络检测请求失败：${error.message || error}` };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -1166,6 +1235,7 @@
     return {
       seatId: dom.fields.seatId.value.trim(),
       runAt: dom.fields.runAt.value.trim(),
+      continuousRequest: dom.fields.continuousRequest.checked,
       dayExpr: dom.fields.dayExpr.value.trim(),
       timeRange: dom.fields.timeRange.value.trim()
     };
@@ -1180,7 +1250,7 @@
     if (!dayExpr) return fail('请选择预约日期');
     const timeRange = normalizeTimeRange(form.timeRange);
     if (!timeRange) return fail(`预约时间段格式应为 HH:mm-HH:mm，例如 ${DEFAULT_TIME_RANGE}`);
-    return { ok: true, seatId, runAt, dayExpr, timeRange };
+    return { ok: true, seatId, runAt, dayExpr, timeRange, continuousRequest: Boolean(form.continuousRequest) };
   }
 
   function fail(message) {
@@ -1226,16 +1296,20 @@
   }
 
   function schedulerTick() {
-    if (state.busy) return;
     const now = new Date();
     let changed = false;
     state.tasks.forEach(task => {
       if (task.running || task.completedAt || task.missedAt) return;
       const dueAt = scheduledDateTime(task.runAt);
       if (!dueAt) return;
+      const diff = dueAt.getTime() - now.getTime();
+      if (diff > 0 && diff <= RESERVATION_PREPARE_LEAD_MS) {
+        ensurePreparedRequest(task);
+      }
       if (now.getTime() - dueAt.getTime() > RUN_GRACE_MS) {
         task.missedAt = now.toISOString();
         task.status = '已错过：超过 10 分钟宽限窗口';
+        preparedRequests.delete(task.id);
         changed = true;
       }
     });
@@ -1244,7 +1318,7 @@
       render();
     }
 
-    const dueTask = state.tasks.find(task => {
+    const dueTasks = state.tasks.filter(task => {
       if (task.running) return false;
       if (task.completedAt || task.missedAt) return false;
       const dueAt = scheduledDateTime(task.runAt);
@@ -1252,8 +1326,7 @@
       const diff = now.getTime() - dueAt.getTime();
       return diff >= 0 && diff <= RUN_GRACE_MS;
     });
-    if (!dueTask) return;
-    runTask(dueTask);
+    dueTasks.forEach(runTask);
   }
 
   function updateTaskCountdowns() {
@@ -1300,14 +1373,13 @@
   }
 
   async function runTask(task) {
-    state.busy = true;
     task.running = true;
     task.status = '执行中：准备网络预约';
     saveTasks();
     render();
 
     try {
-      const result = await reserveSeatByNetwork(task);
+      const result = await runReservationAttempts(task);
       task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
       task.status = result || `预约成功：${toDateText(new Date())} ${new Date().toLocaleTimeString()}`;
@@ -1322,13 +1394,99 @@
       toast(task.status);
     } finally {
       task.running = false;
-      state.busy = false;
+      preparedRequests.delete(task.id);
       saveTasks();
       render();
     }
   }
 
-  async function reserveSeatByNetwork(task) {
+  async function runReservationAttempts(task) {
+    const dueAt = scheduledDateTime(task.runAt) || new Date();
+    const attemptCount = task.continuousRequest === false ? 1 : CONTINUOUS_REQUEST_ATTEMPTS;
+    const prepared = await getPreparedRequest(task);
+
+    if (attemptCount <= 1) {
+      const result = await submitPreparedReservation(prepared);
+      return formatReservationSuccess(prepared, result);
+    }
+
+    const submissions = [];
+    for (let index = 0; index < attemptCount; index += 1) {
+      const targetAt = dueAt.getTime() + index * CONTINUOUS_REQUEST_INTERVAL_MS;
+      const waitMs = targetAt - Date.now();
+      if (waitMs > 0) {
+        task.status = `连续请求：等待发送第 ${index + 1}/${attemptCount} 次`;
+        saveTasks();
+        render();
+        await delay(waitMs);
+      }
+
+      task.status = `连续请求：已发送第 ${index + 1}/${attemptCount} 次`;
+      saveTasks();
+      render();
+
+      submissions.push(
+        submitPreparedReservation(prepared)
+          .then(result => ({ ok: true, index, result }))
+          .catch(error => ({ ok: false, index, message: error.message || String(error) }))
+      );
+    }
+
+    task.status = `连续请求：${attemptCount} 次已全部发出，等待服务器返回`;
+    saveTasks();
+    render();
+
+    const results = await Promise.all(submissions);
+    const success = results.find(result => result.ok);
+    if (success) {
+      return `${formatReservationSuccess(prepared, success.result)}；连续请求第 ${success.index + 1}/${attemptCount} 次成功`;
+    }
+
+    const failures = results
+      .filter(result => !result.ok)
+      .map(result => `第 ${result.index + 1} 次：${result.message}`);
+    throw new Error(failures.length ? `连续请求均失败；${failures.slice(-2).join('；')}` : '预约请求失败');
+  }
+
+  function ensurePreparedRequest(task) {
+    const existing = preparedRequests.get(task.id);
+    if (existing && existing.signature === reserveTaskSignature(task)) return;
+    getPreparedRequest(task).catch(error => {
+      if (task.completedAt || task.missedAt || task.running) return;
+      task.status = `准备失败：${error.message || error}；到点会重新尝试`;
+      saveTasks();
+      render();
+    });
+  }
+
+  function getPreparedRequest(task) {
+    const signature = reserveTaskSignature(task);
+    const existing = preparedRequests.get(task.id);
+    if (existing && existing.signature === signature) {
+      if (existing.prepared) return Promise.resolve(existing.prepared);
+      if (existing.promise) return existing.promise;
+    }
+
+    const entry = {
+      prepared: null,
+      promise: null,
+      signature
+    };
+    entry.promise = prepareReserveRequest(task)
+      .then(prepared => {
+        entry.prepared = prepared;
+        entry.promise = null;
+        return prepared;
+      })
+      .catch(error => {
+        preparedRequests.delete(task.id);
+        throw error;
+      });
+    preparedRequests.set(task.id, entry);
+    return entry.promise;
+  }
+
+  async function prepareReserveRequest(task) {
     const roomId = getTaskRoomId(task);
     if (!roomId) throw new Error('任务未记录房间，请在目标房间页面重新创建任务');
 
@@ -1340,7 +1498,7 @@
     const user = await getCurrentUser();
     const accNo = user.accNo;
 
-    task.status = `执行中：查询座位 ${task.seatId}`;
+    task.status = `准备中：查询座位 ${task.seatId}`;
     saveTasks();
     render();
 
@@ -1350,7 +1508,7 @@
     const device = findReserveDevice(reserveInfo.data, task.seatId);
     if (!device) throw new Error(`房间 ${roomId} 未找到座位 ${task.seatId}`);
 
-    task.status = `执行中：提交预约 ${task.seatId}`;
+    task.status = `准备完成：等待提交 ${task.seatId}`;
     saveTasks();
     render();
 
@@ -1367,13 +1525,45 @@
       resvDev: [device.devId],
       memo: DEFAULT_APPLY_NOTE
     };
-    const result = await requestApi('/ic-web/reserve', {
-      body: JSON.stringify(payload),
-      method: 'POST',
+    return {
+      endTime,
+      payload,
+      roomId,
+      seatId: task.seatId,
+      startTime,
+      targetDate,
       token: user.token
+    };
+  }
+
+  async function submitPreparedReservation(prepared) {
+    const result = await requestApi('/ic-web/reserve', {
+      body: JSON.stringify(prepared.payload),
+      method: 'POST',
+      token: prepared.token
     });
-    const message = result.message || '提交成功';
-    return `预约成功：${task.seatId} ${targetDate} ${startTime.slice(0, 5)}-${endTime.slice(0, 5)}（${message}）`;
+    return {
+      data: result.data || null,
+      message: result.message || '提交成功'
+    };
+  }
+
+  function formatReservationSuccess(prepared, result) {
+    return `预约成功：${prepared.seatId} ${prepared.targetDate} ${prepared.startTime.slice(0, 5)}-${prepared.endTime.slice(0, 5)}（${result.message}）`;
+  }
+
+  function reserveTaskSignature(task) {
+    return JSON.stringify({
+      roomId: getTaskRoomId(task),
+      runAt: task.runAt,
+      seatId: task.seatId,
+      targetDate: task.targetDate || resolveTargetDate(task.dayExpr),
+      timeRange: task.timeRange
+    });
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
   }
 
   async function getCurrentUser() {
@@ -1386,6 +1576,12 @@
   async function requestApi(url, options = {}) {
     const page = getPageWindow();
     const pageFetch = page?.fetch?.bind(page) || fetch;
+    const Controller = page?.AbortController || AbortController;
+    const controller = new Controller();
+    const timeoutMs = options.timeoutMs ?? API_REQUEST_TIMEOUT_MS;
+    const timeoutId = timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : 0;
     const headers = {
       accept: 'application/json, text/plain, */*',
       ...options.headers
@@ -1400,35 +1596,51 @@
 
     let response;
     try {
-      response = await pageFetch(url, {
-        body: options.body,
-        cache: 'no-store',
-        credentials: 'include',
-        headers,
-        method: options.method || 'GET',
-        redirect: 'manual'
-      });
-    } catch (error) {
-      throw new Error(`网络请求失败：${error.message || error}`);
-    }
+      try {
+        response = await pageFetch(url, {
+          body: options.body,
+          cache: 'no-store',
+          credentials: 'include',
+          headers,
+          method: options.method || 'GET',
+          redirect: 'manual',
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          throw new Error(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到响应`);
+        }
+        throw new Error(`网络请求失败：${error.message || error}`);
+      }
 
-    if (response.type === 'opaqueredirect' || response.status === 0) {
-      throw new Error('登录可能已失效：请求被重定向到统一认证');
-    }
-    if (response.status >= 300 && response.status < 400) {
-      throw new Error(`登录可能已失效：接口发生重定向（HTTP ${response.status}）`);
-    }
-    if (!response.ok) {
-      throw new Error(`接口请求失败（HTTP ${response.status}）`);
-    }
+      if (response.type === 'opaqueredirect' || response.status === 0) {
+        throw new Error('登录可能已失效：请求被重定向到统一认证');
+      }
+      if (response.status >= 300 && response.status < 400) {
+        throw new Error(`登录可能已失效：接口发生重定向（HTTP ${response.status}）`);
+      }
+      if (!response.ok) {
+        throw new Error(`接口请求失败（HTTP ${response.status}）`);
+      }
 
-    const text = await response.text().catch(() => '');
-    const data = parseJson(text);
-    if (!data) throw new Error('接口返回不是 JSON');
-    if (data.code !== undefined && data.code !== 0 && data.code !== '0') {
-      throw new Error(data.message || data.msg || `接口返回错误：${data.code}`);
+      let text = '';
+      try {
+        text = await response.text();
+      } catch (error) {
+        if (error?.name === 'AbortError') {
+          throw new Error(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到完整响应`);
+        }
+        throw new Error(`读取响应失败：${error.message || error}`);
+      }
+      const data = parseJson(text);
+      if (!data) throw new Error('接口返回不是 JSON');
+      if (data.code !== undefined && data.code !== 0 && data.code !== '0') {
+        throw new Error(data.message || data.msg || `接口返回错误：${data.code}`);
+      }
+      return data;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
-    return data;
   }
 
   function getTaskRoomId(task) {
@@ -1477,6 +1689,10 @@
       : dayLabel(task.dayExpr);
   }
 
+  function continuousRequestLabel(task) {
+    return task.continuousRequest === false ? '单次请求' : '连续请求';
+  }
+
   function dayOptionByValue(value) {
     return DAY_OPTION_DEFINITIONS.find(option => option.value === value) || null;
   }
@@ -1512,6 +1728,10 @@
 
   function formatClock(date) {
     return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  }
+
+  function formatTimeInput(date) {
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
   }
 
   function defaultRunAt() {
@@ -1606,6 +1826,7 @@
       return tasks.map(task => ({
         ...task,
         runAt: task.runAt === LEGACY_RUN_TIME ? defaultRunAt() : (normalizeRunAt(task.runAt) || defaultRunAt()),
+        continuousRequest: task.continuousRequest !== false,
         dayExpr: isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天',
         targetDate: normalizeDateText(task.targetDate) || resolveTargetDate(isValidDayExpr(task.dayExpr) ? task.dayExpr : '明天'),
         timeRange: normalizeTimeRange(task.timeRange) || DEFAULT_TIME_RANGE,
@@ -1627,6 +1848,7 @@
     const fallback = {
       seatId: '',
       runAt: defaultRunAt(),
+      continuousRequest: true,
       dayExpr: '明天',
       timeRange: DEFAULT_TIME_RANGE,
       routeHash: location.hash,
@@ -1637,6 +1859,7 @@
       saved.runAt = saved.runAt === LEGACY_RUN_TIME
         ? defaultRunAt()
         : (normalizeRunAt(saved.runAt) || defaultRunAt());
+      saved.continuousRequest = saved.continuousRequest !== false;
       if (!isValidDayExpr(saved.dayExpr)) saved.dayExpr = '明天';
       saved.timeRange = normalizeTimeRange(saved.timeRange) || DEFAULT_TIME_RANGE;
       return saved;
