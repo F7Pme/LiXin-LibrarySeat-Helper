@@ -231,29 +231,40 @@
         font-size: 12px;
         font-weight: 600;
       }
-      .lsh-label-row {
+      .lsh-input-wrap {
+        position: relative;
+      }
+      .lsh-input-wrap input {
+        padding-right: var(--lsh-input-action-space, 10px);
+      }
+      .lsh-run-input {
+        --lsh-input-action-space: 92px;
+      }
+      .lsh-range-input {
+        --lsh-input-action-space: 52px;
+      }
+      .lsh-input-actions {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        bottom: 4px;
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        min-height: 18px;
+        gap: 4px;
       }
-      .lsh-mini-actions {
-        display: flex;
-        flex: 0 0 auto;
-        gap: 5px;
-      }
-      .lsh-mini-button {
-        height: 22px;
+      .lsh-input-button {
+        height: 26px;
+        min-width: 38px;
+        padding: 0 7px;
         border: 1px solid #cbd5e1;
         border-radius: 5px;
-        background: #fff;
+        background: #f8fafc;
         color: #146c94;
         cursor: pointer;
         font-size: 12px;
-        line-height: 20px;
+        line-height: 24px;
       }
-      .lsh-mini-button:hover {
+      .lsh-input-button:hover {
         background: #f0f9ff;
         border-color: #7dd3fc;
       }
@@ -431,28 +442,28 @@
               <input data-lsh-field="seatId" autocomplete="off" placeholder="例如 PDW3FA3001">
             </div>
             <div class="lsh-target-room" data-lsh-target-room></div>
-            <div class="lsh-field">
-              <div class="lsh-label-row">
-                <label>几点开始执行预约</label>
-                <div class="lsh-mini-actions">
-                  <button class="lsh-mini-button" type="button" data-lsh-run-now>现在</button>
-                  <button class="lsh-mini-button" type="button" data-lsh-run-default>默认</button>
+            <div class="lsh-field lsh-field-wide">
+              <label>几点开始执行预约</label>
+              <div class="lsh-input-wrap lsh-run-input">
+                <input data-lsh-field="runAt" autocomplete="off" placeholder="YYYY-MM-DD HH:mm:ss">
+                <div class="lsh-input-actions">
+                  <button class="lsh-input-button" type="button" data-lsh-run-now>现在</button>
+                  <button class="lsh-input-button" type="button" data-lsh-run-default>默认</button>
                 </div>
               </div>
-              <input data-lsh-field="runAt" autocomplete="off" placeholder="YYYY-MM-DD HH:mm:ss">
             </div>
-            <div class="lsh-field">
+            <div class="lsh-field lsh-field-wide">
               <label>预约哪一天</label>
               <select data-lsh-field="dayExpr"></select>
             </div>
             <div class="lsh-field lsh-field-wide">
-              <div class="lsh-label-row">
-                <label>预约时间段</label>
-                <div class="lsh-mini-actions">
-                  <button class="lsh-mini-button" type="button" data-lsh-time-reset>重置</button>
+              <label>预约时间段</label>
+              <div class="lsh-input-wrap lsh-range-input">
+                <input data-lsh-field="timeRange" autocomplete="off" placeholder="例如 ${DEFAULT_TIME_RANGE}">
+                <div class="lsh-input-actions">
+                  <button class="lsh-input-button" type="button" data-lsh-time-reset>重置</button>
                 </div>
               </div>
-              <input data-lsh-field="timeRange" autocomplete="off" placeholder="例如 ${DEFAULT_TIME_RANGE}">
             </div>
           </div>
           <button class="lsh-primary" type="button">提交任务</button>
