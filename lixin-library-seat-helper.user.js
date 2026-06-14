@@ -8,6 +8,7 @@
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_notification
+// @grant        GM_setClipboard
 // @grant        unsafeWindow
 // ==/UserScript==
 
@@ -22,9 +23,7 @@
   const RESERVATION_REFRESH_INTERVAL_MS = 30 * 1000;
   const RESERVATION_LOOKAHEAD_DAYS = 7;
   const RESERVATION_PAGE_SIZE = 20;
-  const CONTINUOUS_REQUEST_ATTEMPTS = 6;
   const CONTINUOUS_REQUEST_INTERVAL_MS = 1000;
-  const RESERVATION_PREPARE_LEAD_MS = 30 * 1000;
   const API_REQUEST_TIMEOUT_MS = 5 * 1000;
   const LOGIN_PROBE_FALLBACK_PATH = '/ic-web/auth/userInfo';
   const LOGIN_RESPONSE_PREVIEW_LIMIT = 3000;
@@ -72,7 +71,7 @@
   };
 
   const dom = {};
-  const preparedRequests = new Map();
+  const activeRuns = new Map();
 
   boot();
 
@@ -411,6 +410,50 @@
         line-height: 1.45;
         word-break: break-word;
       }
+      .lsh-task-log {
+        margin-top: 8px;
+        border-top: 1px solid #e2e8f0;
+        padding-top: 7px;
+      }
+      .lsh-task-log summary {
+        color: #146c94;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.4;
+      }
+      .lsh-task-log-actions {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 6px;
+      }
+      .lsh-copy {
+        height: 26px;
+        border: 1px solid #bfdbfe;
+        border-radius: 6px;
+        background: #eff6ff;
+        color: #1d4ed8;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .lsh-copy:hover {
+        background: #dbeafe;
+      }
+      .lsh-task-log pre {
+        max-height: 220px;
+        overflow: auto;
+        margin: 6px 0 0;
+        padding: 8px;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        background: #f8fafc;
+        color: #0f172a;
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
       .lsh-cancel {
         flex: 0 0 auto;
         height: 28px;
@@ -576,14 +619,22 @@
       cancelReservation(button.getAttribute('data-lsh-cancel-reservation'));
     });
     dom.taskList.addEventListener('click', event => {
+      const copyButton = event.target.closest('[data-lsh-copy-log]');
+      if (copyButton) {
+        event.preventDefault();
+        event.stopPropagation();
+        copyTaskResponseLogs(copyButton.getAttribute('data-lsh-copy-log'));
+        return;
+      }
+
       const button = event.target.closest('[data-lsh-cancel]');
       if (!button) return;
       const id = button.getAttribute('data-lsh-cancel');
+      const stopped = cancelTaskRun(id);
       state.tasks = state.tasks.filter(task => task.id !== id);
-      preparedRequests.delete(id);
       saveTasks();
       render();
-      toast('已取消任务');
+      toast(stopped ? '已停止并取消任务' : '已取消任务');
     });
   }
 
@@ -697,6 +748,9 @@
       completedAt: '',
       missedAt: '',
       running: false,
+      responseLogs: [],
+      responseCount: 0,
+      sentCount: 0,
       status: '等待执行'
     };
     state.tasks.push(task);
@@ -758,14 +812,81 @@
               <div class="lsh-task-meta">${escapeHtml(formatRunAtLabel(task.runAt))} / ${escapeHtml(formatTargetDateLabel(task))} / ${escapeHtml(task.timeRange || DEFAULT_TIME_RANGE)} / ${escapeHtml(continuousRequestLabel(task))}</div>
               <div class="lsh-task-meta">${escapeHtml(task.roomName || task.routeHash || '当前座位页')}</div>
             </div>
-            <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">取消</button>
+            <button class="lsh-cancel" type="button" data-lsh-cancel="${escapeHtml(task.id)}">${task.running ? '停止' : '取消'}</button>
           </div>
           <div class="lsh-task-status">${escapeHtml(task.status || '等待执行')}</div>
           <div class="lsh-task-countdown" data-lsh-countdown="${escapeHtml(task.id)}"></div>
+          ${renderTaskResponseLogs(task)}
         </div>
       `)
       .join('');
     updateTaskCountdowns();
+  }
+
+  function renderTaskResponseLogs(task) {
+    const logs = Array.isArray(task.responseLogs) ? task.responseLogs : [];
+    if (!logs.length) return '';
+    return `
+      <details class="lsh-task-log" open>
+        <summary>完整响应日志（${logs.length}）</summary>
+        <div class="lsh-task-log-actions">
+          <button class="lsh-copy" type="button" data-lsh-copy-log="${escapeHtml(task.id)}">复制</button>
+        </div>
+        <pre>${escapeHtml(taskResponseLogText(task))}</pre>
+      </details>
+    `;
+  }
+
+  function taskResponseLogText(task) {
+    const logs = Array.isArray(task.responseLogs) ? task.responseLogs : [];
+    return [
+      `任务：${task.seatId || ''}`,
+      formatRunAtLabel(task.runAt),
+      formatTargetDateLabel(task),
+      `时间段：${task.timeRange || DEFAULT_TIME_RANGE}`,
+      `房间：${task.roomName || task.routeHash || '当前座位页'}`,
+      `状态：${task.status || '等待执行'}`,
+      '',
+      logs.map(formatTaskResponseLog).join('\n\n')
+    ].filter(part => part !== '').join('\n');
+  }
+
+  function formatTaskResponseLog(log) {
+    const at = log.at ? formatClock(new Date(log.at)) : '--:--:--';
+    const title = `#${log.attempt || '?'} ${log.ok ? '成功' : '失败'} ${at}`;
+    return [
+      title,
+      log.message ? `消息：${log.message}` : '',
+      log.response ? `响应：${log.response}` : '',
+      log.error ? `错误：${log.error}` : ''
+    ].filter(Boolean).join('\n');
+  }
+
+  async function copyTaskResponseLogs(taskId) {
+    const task = state.tasks.find(item => item.id === taskId);
+    if (!task || !Array.isArray(task.responseLogs) || !task.responseLogs.length) {
+      toast('暂无可复制的响应日志');
+      return;
+    }
+
+    try {
+      await writeClipboardText(taskResponseLogText(task));
+      toast('完整响应日志已复制');
+    } catch (error) {
+      toast(`复制失败：${error.message || error}`);
+    }
+  }
+
+  async function writeClipboardText(text) {
+    if (typeof GM_setClipboard === 'function') {
+      GM_setClipboard(text, 'text');
+      return;
+    }
+
+    const page = getPageWindow();
+    const clipboard = page?.navigator?.clipboard || navigator?.clipboard;
+    if (!clipboard?.writeText) throw new Error('当前浏览器不支持剪贴板写入');
+    await clipboard.writeText(text);
   }
 
   function fieldDisplayValue(key, value) {
@@ -1295,6 +1416,61 @@
     return `${start}-${end}`;
   }
 
+  function createTaskRunControl(task) {
+    const control = {
+      cancelled: false,
+      controllers: new Set(),
+      finished: false,
+      id: task.id
+    };
+    activeRuns.set(task.id, control);
+    return control;
+  }
+
+  function cancelTaskRun(id) {
+    const control = activeRuns.get(id);
+    if (!control) return false;
+    control.cancelled = true;
+    abortTaskRunRequests(control);
+    return true;
+  }
+
+  function finishTaskRun(control) {
+    if (!control) return;
+    control.finished = true;
+    abortTaskRunRequests(control);
+  }
+
+  function abortTaskRunRequests(control) {
+    if (!control) return;
+    control.controllers.forEach(controller => {
+      try {
+        controller.abort();
+      } catch {
+        // Request may already be settled.
+      }
+    });
+    control.controllers.clear();
+  }
+
+  function isRunStopped(control) {
+    return Boolean(control?.cancelled || control?.finished);
+  }
+
+  function throwIfRunCancelled(control) {
+    if (control?.cancelled) throw createCancelError();
+  }
+
+  function createCancelError() {
+    const error = new Error('任务已取消');
+    error.cancelled = true;
+    return error;
+  }
+
+  function isCancelError(error) {
+    return Boolean(error?.cancelled);
+  }
+
   function schedulerTick() {
     const now = new Date();
     let changed = false;
@@ -1302,14 +1478,9 @@
       if (task.running || task.completedAt || task.missedAt) return;
       const dueAt = scheduledDateTime(task.runAt);
       if (!dueAt) return;
-      const diff = dueAt.getTime() - now.getTime();
-      if (diff > 0 && diff <= RESERVATION_PREPARE_LEAD_MS) {
-        ensurePreparedRequest(task);
-      }
       if (now.getTime() - dueAt.getTime() > RUN_GRACE_MS) {
         task.missedAt = now.toISOString();
         task.status = '已错过：超过 10 分钟宽限窗口';
-        preparedRequests.delete(task.id);
         changed = true;
       }
     });
@@ -1373,13 +1544,18 @@
   }
 
   async function runTask(task) {
+    const control = createTaskRunControl(task);
     task.running = true;
+    task.responseLogs = [];
+    task.responseCount = 0;
+    task.sentCount = 0;
     task.status = '执行中：准备网络预约';
     saveTasks();
     render();
 
     try {
-      const result = await runReservationAttempts(task);
+      const result = await runReservationAttempts(task, control);
+      if (control.cancelled) return;
       task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
       task.status = result || `预约成功：${toDateText(new Date())} ${new Date().toLocaleTimeString()}`;
@@ -1387,6 +1563,7 @@
       notify('立信座位助手', task.status);
       toast(task.status);
     } catch (error) {
+      if (isCancelError(error) || control.cancelled) return;
       task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
       task.status = `失败：${error.message || error}`;
@@ -1394,99 +1571,217 @@
       toast(task.status);
     } finally {
       task.running = false;
-      preparedRequests.delete(task.id);
-      saveTasks();
-      render();
+      activeRuns.delete(task.id);
+      if (state.tasks.includes(task)) {
+        saveTasks();
+        render();
+      }
     }
   }
 
-  async function runReservationAttempts(task) {
+  async function runReservationAttempts(task, control) {
     const dueAt = scheduledDateTime(task.runAt) || new Date();
-    const attemptCount = task.continuousRequest === false ? 1 : CONTINUOUS_REQUEST_ATTEMPTS;
-    const prepared = await getPreparedRequest(task);
+    const prepared = await prepareReserveRequest(task, control);
 
-    if (attemptCount <= 1) {
-      const result = await submitPreparedReservation(prepared);
-      return formatReservationSuccess(prepared, result);
+    if (task.continuousRequest === false) {
+      const result = await submitReservationAttempt(prepared, task, 1, control);
+      if (result.ok) return formatReservationSuccess(prepared, result.result);
+      if (result.terminal) throw new Error(result.message || '预约失败，已停止继续请求');
+      throw new Error(result.message || '预约请求失败');
     }
 
-    const submissions = [];
-    for (let index = 0; index < attemptCount; index += 1) {
-      const targetAt = dueAt.getTime() + index * CONTINUOUS_REQUEST_INTERVAL_MS;
+    const inFlight = new Set();
+    let attempt = 0;
+    let success = null;
+    let terminalFailure = null;
+
+    while (!isRunStopped(control) && !success && !terminalFailure) {
+      attempt += 1;
+      const targetAt = dueAt.getTime() + (attempt - 1) * CONTINUOUS_REQUEST_INTERVAL_MS;
       const waitMs = targetAt - Date.now();
       if (waitMs > 0) {
-        task.status = `连续请求：等待发送第 ${index + 1}/${attemptCount} 次`;
+        task.status = `连续请求：等待发送第 ${attempt} 次`;
         saveTasks();
         render();
         await delay(waitMs);
       }
+      throwIfRunCancelled(control);
+      if (control.finished) break;
 
-      task.status = `连续请求：已发送第 ${index + 1}/${attemptCount} 次`;
+      task.sentCount = attempt;
+      task.status = `连续请求：已发送第 ${attempt} 次，成功前每秒继续`;
       saveTasks();
       render();
 
-      submissions.push(
-        submitPreparedReservation(prepared)
-          .then(result => ({ ok: true, index, result }))
-          .catch(error => ({ ok: false, index, message: error.message || String(error) }))
-      );
+      const submission = submitReservationAttempt(prepared, task, attempt, control)
+        .then(result => {
+          inFlight.delete(submission);
+          if (result.ok && !isRunStopped(control)) {
+            success = result;
+            finishTaskRun(control);
+          } else if (result.terminal && !isRunStopped(control)) {
+            terminalFailure = result;
+            finishTaskRun(control);
+          }
+          return result;
+        })
+        .catch(error => {
+          inFlight.delete(submission);
+          if (!isCancelError(error)) throw error;
+          return { cancelled: true };
+        });
+      inFlight.add(submission);
     }
 
-    task.status = `连续请求：${attemptCount} 次已全部发出，等待服务器返回`;
-    saveTasks();
-    render();
+    while (!success && !terminalFailure && inFlight.size && !control.cancelled) {
+      const settled = await Promise.race(Array.from(inFlight));
+      if (settled?.ok) success = settled;
+      if (settled?.terminal) terminalFailure = settled;
+    }
 
-    const results = await Promise.all(submissions);
-    const success = results.find(result => result.ok);
     if (success) {
-      return `${formatReservationSuccess(prepared, success.result)}；连续请求第 ${success.index + 1}/${attemptCount} 次成功`;
+      finishTaskRun(control);
+      return `${formatReservationSuccess(prepared, success.result)}；连续请求第 ${success.attempt} 次成功，共发出 ${task.sentCount || success.attempt} 次`;
     }
 
-    const failures = results
-      .filter(result => !result.ok)
-      .map(result => `第 ${result.index + 1} 次：${result.message}`);
-    throw new Error(failures.length ? `连续请求均失败；${failures.slice(-2).join('；')}` : '预约请求失败');
+    if (terminalFailure) {
+      throw new Error(terminalFailure.message || '预约失败，已停止继续请求');
+    }
+
+    throwIfRunCancelled(control);
+    throw new Error('连续请求已停止但未收到成功响应');
   }
 
-  function ensurePreparedRequest(task) {
-    const existing = preparedRequests.get(task.id);
-    if (existing && existing.signature === reserveTaskSignature(task)) return;
-    getPreparedRequest(task).catch(error => {
-      if (task.completedAt || task.missedAt || task.running) return;
-      task.status = `准备失败：${error.message || error}；到点会重新尝试`;
+  async function submitReservationAttempt(prepared, task, attempt, control) {
+    const mode = task.continuousRequest === false ? '单次请求' : '连续请求';
+    try {
+      const result = await submitPreparedReservation(prepared, control);
+      appendTaskResponseLog(task, {
+        attempt,
+        ok: true,
+        message: result.message || '提交成功',
+        response: result.raw
+      });
+      task.responseCount = (task.responseCount || 0) + 1;
+      task.status = `${mode}：第 ${attempt} 次成功，已收到 ${task.responseCount} 个响应`;
       saveTasks();
       render();
+      return { attempt, ok: true, result };
+    } catch (error) {
+      if (isCancelError(error) || isRunStopped(control)) throw createCancelError();
+      const verified = await verifyExistingReservationAfterFailure(prepared, task, attempt, control, error);
+      if (verified) return verified;
+      const detail = apiErrorDetail(error);
+      const terminalMessage = terminalReservationFailureMessage(error);
+      appendTaskResponseLog(task, {
+        attempt,
+        ok: false,
+        message: error.message || String(error),
+        response: detail
+      });
+      task.responseCount = (task.responseCount || 0) + 1;
+      task.status = terminalMessage
+        ? `${mode}：${terminalMessage}，已停止继续请求`
+        : `${mode}：已发送 ${task.sentCount || attempt} 次，收到 ${task.responseCount} 个响应，最近第 ${attempt} 次失败：${error.message || error}`;
+      saveTasks();
+      render();
+      return {
+        attempt,
+        message: terminalMessage || error.message || String(error),
+        ok: false,
+        terminal: Boolean(terminalMessage)
+      };
+    }
+  }
+
+  async function verifyExistingReservationAfterFailure(prepared, task, attempt, control, error) {
+    if (!shouldVerifyExistingReservation(error)) return null;
+
+    let result;
+    try {
+      result = await requestApi(`/ic-web/reserve/resvInfo?${targetReservationListParams(prepared).toString()}`, {
+        control,
+        token: prepared.token
+      });
+    } catch (verifyError) {
+      if (isCancelError(verifyError) || isRunStopped(control)) throw createCancelError();
+      return null;
+    }
+
+    const rows = extractReservationRows(result.data);
+    const matched = rows.find(row => reservationMatchesPrepared(row, prepared));
+    if (!matched) return null;
+
+    appendTaskResponseLog(task, {
+      attempt,
+      ok: true,
+      message: '提交返回已有预约，已反查确认目标预约存在',
+      response: {
+        failedSubmit: apiErrorDetail(error),
+        matchedReservation: matched,
+        verification: result
+      }
+    });
+    task.responseCount = (task.responseCount || 0) + 1;
+    task.status = `${task.continuousRequest === false ? '单次请求' : '连续请求'}：第 ${attempt} 次确认目标预约已存在，停止继续请求`;
+    saveTasks();
+    render();
+    return {
+      attempt,
+      ok: true,
+      result: {
+        data: matched,
+        message: '已确认目标预约存在'
+      }
+    };
+  }
+
+  function shouldVerifyExistingReservation(error) {
+    const message = String(error?.message || error?.apiResponse?.message || error?.apiResponse?.msg || '');
+    return /当前时段有预约|已有预约|已存在预约/.test(message);
+  }
+
+  function terminalReservationFailureMessage(error) {
+    const message = String(error?.message || error?.apiResponse?.message || error?.apiResponse?.msg || '');
+    if (!message) return '';
+    if (/正在被预约|请稍后重试/.test(message)) return '';
+    if (/设备在该时间段内已被预约|设备在该时段内已被预约|当前设备已被预约|目标设备已被预约|设备已被预约/.test(message)) {
+      return '目标座位该时间段已被预约';
+    }
+    if (/当前时段有预约|已有预约|已存在预约/.test(message)) {
+      return '当前账号在该时段已有其他预约';
+    }
+    return '';
+  }
+
+  function targetReservationListParams(prepared) {
+    return new URLSearchParams({
+      beginDate: prepared.targetDate,
+      endDate: prepared.targetDate,
+      needStatus: '6',
+      page: '1',
+      pageNum: String(RESERVATION_PAGE_SIZE),
+      orderKey: 'gmt_create',
+      orderModel: 'desc'
     });
   }
 
-  function getPreparedRequest(task) {
-    const signature = reserveTaskSignature(task);
-    const existing = preparedRequests.get(task.id);
-    if (existing && existing.signature === signature) {
-      if (existing.prepared) return Promise.resolve(existing.prepared);
-      if (existing.promise) return existing.promise;
-    }
+  function reservationMatchesPrepared(row, prepared) {
+    const device = reservationDeviceInfo(row);
+    const rowDevId = Number(device.devId || row?.devId || row?.resvDevId || 0);
+    const targetDevId = Number(prepared.payload?.resvDev?.[0] || 0);
+    const seatMatches = normalizeSeatId(reservationSeatLabel(row)) === normalizeSeatId(prepared.seatId);
+    const deviceMatches = targetDevId > 0 && rowDevId === targetDevId;
+    if (!seatMatches && !deviceMatches) return false;
 
-    const entry = {
-      prepared: null,
-      promise: null,
-      signature
-    };
-    entry.promise = prepareReserveRequest(task)
-      .then(prepared => {
-        entry.prepared = prepared;
-        entry.promise = null;
-        return prepared;
-      })
-      .catch(error => {
-        preparedRequests.delete(task.id);
-        throw error;
-      });
-    preparedRequests.set(task.id, entry);
-    return entry.promise;
+    const begin = formatReservationDateTime(row?.resvBeginTime || row?.beginTime);
+    const end = formatReservationDateTime(row?.resvEndTime || row?.endTime);
+    const expectedBegin = `${prepared.targetDate} ${prepared.startTime.slice(0, 5)}`;
+    const expectedEnd = `${prepared.targetDate} ${prepared.endTime.slice(0, 5)}`;
+    return begin === expectedBegin && end === expectedEnd;
   }
 
-  async function prepareReserveRequest(task) {
+  async function prepareReserveRequest(task, control) {
     const roomId = getTaskRoomId(task);
     if (!roomId) throw new Error('任务未记录房间，请在目标房间页面重新创建任务');
 
@@ -1495,7 +1790,7 @@
     const [startTime, endTime] = task.timeRange.split('-').map(toTimeWithSeconds);
     if (!startTime || !endTime) throw new Error('预约时间段无效');
 
-    const user = await getCurrentUser();
+    const user = await getCurrentUser(control);
     const accNo = user.accNo;
 
     task.status = `准备中：查询座位 ${task.seatId}`;
@@ -1503,6 +1798,7 @@
     render();
 
     const reserveInfo = await requestApi(`/ic-web/reserve?roomIds=${encodeURIComponent(roomId)}&resvDates=${reserveDate}&sysKind=8`, {
+      control,
       token: user.token
     });
     const device = findReserveDevice(reserveInfo.data, task.seatId);
@@ -1536,15 +1832,17 @@
     };
   }
 
-  async function submitPreparedReservation(prepared) {
+  async function submitPreparedReservation(prepared, control) {
     const result = await requestApi('/ic-web/reserve', {
       body: JSON.stringify(prepared.payload),
+      control,
       method: 'POST',
       token: prepared.token
     });
     return {
       data: result.data || null,
-      message: result.message || '提交成功'
+      message: result.message || '提交成功',
+      raw: result
     };
   }
 
@@ -1552,22 +1850,51 @@
     return `预约成功：${prepared.seatId} ${prepared.targetDate} ${prepared.startTime.slice(0, 5)}-${prepared.endTime.slice(0, 5)}（${result.message}）`;
   }
 
-  function reserveTaskSignature(task) {
-    return JSON.stringify({
-      roomId: getTaskRoomId(task),
-      runAt: task.runAt,
-      seatId: task.seatId,
-      targetDate: task.targetDate || resolveTargetDate(task.dayExpr),
-      timeRange: task.timeRange
+  function appendTaskResponseLog(task, entry) {
+    if (!Array.isArray(task.responseLogs)) task.responseLogs = [];
+    task.responseLogs.push({
+      attempt: entry.attempt,
+      at: new Date().toISOString(),
+      error: entry.error || '',
+      message: entry.message || '',
+      ok: Boolean(entry.ok),
+      response: stringifyLogValue(entry.response)
     });
+  }
+
+  function apiErrorDetail(error) {
+    return {
+      message: error.message || String(error),
+      method: error.method || '',
+      status: error.httpStatus || '',
+      url: error.url || '',
+      response: error.apiResponse ?? null,
+      responseText: error.responseText || ''
+    };
+  }
+
+  function createApiError(message, detail = {}) {
+    const error = new Error(message);
+    Object.assign(error, detail);
+    return error;
+  }
+
+  function stringifyLogValue(value) {
+    if (value === undefined || value === null || value === '') return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
   }
 
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
   }
 
-  async function getCurrentUser() {
-    const userInfo = await requestApi(LOGIN_PROBE_FALLBACK_PATH);
+  async function getCurrentUser(control) {
+    const userInfo = await requestApi(LOGIN_PROBE_FALLBACK_PATH, { control });
     const user = userInfo.data || {};
     if (!user.accNo) throw new Error('无法读取当前登录用户');
     return user;
@@ -1578,6 +1905,9 @@
     const pageFetch = page?.fetch?.bind(page) || fetch;
     const Controller = page?.AbortController || AbortController;
     const controller = new Controller();
+    const control = options.control;
+    if (isRunStopped(control)) throw createCancelError();
+    if (control?.controllers) control.controllers.add(controller);
     const timeoutMs = options.timeoutMs ?? API_REQUEST_TIMEOUT_MS;
     const timeoutId = timeoutMs > 0
       ? setTimeout(() => controller.abort(), timeoutMs)
@@ -1608,19 +1938,10 @@
         });
       } catch (error) {
         if (error?.name === 'AbortError') {
-          throw new Error(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到响应`);
+          if (isRunStopped(control)) throw createCancelError();
+          throw createApiError(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到响应`, { url, method: options.method || 'GET' });
         }
-        throw new Error(`网络请求失败：${error.message || error}`);
-      }
-
-      if (response.type === 'opaqueredirect' || response.status === 0) {
-        throw new Error('登录可能已失效：请求被重定向到统一认证');
-      }
-      if (response.status >= 300 && response.status < 400) {
-        throw new Error(`登录可能已失效：接口发生重定向（HTTP ${response.status}）`);
-      }
-      if (!response.ok) {
-        throw new Error(`接口请求失败（HTTP ${response.status}）`);
+        throw createApiError(`网络请求失败：${error.message || error}`, { url, method: options.method || 'GET' });
       }
 
       let text = '';
@@ -1628,18 +1949,67 @@
         text = await response.text();
       } catch (error) {
         if (error?.name === 'AbortError') {
-          throw new Error(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到完整响应`);
+          if (isRunStopped(control)) throw createCancelError();
+          throw createApiError(`网络请求超时：${Math.round(timeoutMs / 1000)} 秒内未收到完整响应`, {
+            httpStatus: response.status,
+            url: response.url || url,
+            method: options.method || 'GET'
+          });
         }
-        throw new Error(`读取响应失败：${error.message || error}`);
+        throw createApiError(`读取响应失败：${error.message || error}`, {
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
       }
       const data = parseJson(text);
-      if (!data) throw new Error('接口返回不是 JSON');
+
+      if (response.type === 'opaqueredirect' || response.status === 0) {
+        throw createApiError('登录可能已失效：请求被重定向到统一认证', {
+          responseText: text,
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
+      }
+      if (response.status >= 300 && response.status < 400) {
+        throw createApiError(`登录可能已失效：接口发生重定向（HTTP ${response.status}）`, {
+          responseText: text,
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
+      }
+      if (!response.ok) {
+        throw createApiError(`接口请求失败（HTTP ${response.status}）`, {
+          apiResponse: data,
+          responseText: text,
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
+      }
+      if (!data) {
+        throw createApiError('接口返回不是 JSON', {
+          responseText: text,
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
+      }
       if (data.code !== undefined && data.code !== 0 && data.code !== '0') {
-        throw new Error(data.message || data.msg || `接口返回错误：${data.code}`);
+        throw createApiError(data.message || data.msg || `接口返回错误：${data.code}`, {
+          apiResponse: data,
+          responseText: text,
+          httpStatus: response.status,
+          url: response.url || url,
+          method: options.method || 'GET'
+        });
       }
       return data;
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
+      if (control?.controllers) control.controllers.delete(controller);
     }
   }
 
@@ -1832,6 +2202,9 @@
         timeRange: normalizeTimeRange(task.timeRange) || DEFAULT_TIME_RANGE,
         completedAt: task.completedAt || '',
         missedAt: task.missedAt || '',
+        responseLogs: Array.isArray(task.responseLogs) ? task.responseLogs : [],
+        responseCount: Number(task.responseCount) || 0,
+        sentCount: Number(task.sentCount) || 0,
         running: false,
         status: task.status || '等待执行'
       }));
@@ -1841,7 +2214,11 @@
   }
 
   function saveTasks() {
-    localStorage.setItem(STORE_KEY, JSON.stringify(state.tasks));
+    const persistedTasks = state.tasks.map(task => {
+      const { responseLogs, ...persistedTask } = task;
+      return persistedTask;
+    });
+    localStorage.setItem(STORE_KEY, JSON.stringify(persistedTasks));
   }
 
   function loadForm() {
