@@ -19,6 +19,9 @@
   const TICK_MS = 1000;
   const RUN_GRACE_MS = 10 * 60 * 1000;
   const LOGIN_CHECK_INTERVAL_MS = 10 * 1000;
+  const RESERVATION_REFRESH_INTERVAL_MS = 30 * 1000;
+  const RESERVATION_LOOKAHEAD_DAYS = 7;
+  const RESERVATION_PAGE_SIZE = 20;
   const LOGIN_PROBE_FALLBACK_PATH = '/ic-web/auth/userInfo';
   const LOGIN_RESPONSE_PREVIEW_LIMIT = 3000;
   const DEFAULT_APPLY_NOTE = '';
@@ -54,6 +57,13 @@
       nextAt: Date.now(),
       lastCheckedAt: 0,
       checking: false
+    },
+    reservations: {
+      items: [],
+      status: '等待刷新',
+      nextAt: Date.now(),
+      lastFetchedAt: 0,
+      loading: false
     },
     toastTimer: 0
   };
@@ -322,7 +332,8 @@
         font-size: 13px;
         font-weight: 700;
       }
-      .lsh-task-list {
+      .lsh-task-list,
+      .lsh-reservation-list {
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -335,7 +346,8 @@
         text-align: center;
         font-size: 12px;
       }
-      .lsh-task {
+      .lsh-task,
+      .lsh-reservation {
         border: 1px solid #e2e8f0;
         border-radius: 6px;
         padding: 10px;
@@ -382,6 +394,10 @@
         color: #b91c1c;
         cursor: pointer;
         font-size: 12px;
+      }
+      .lsh-cancel:disabled {
+        opacity: .55;
+        cursor: not-allowed;
       }
       .lsh-toast {
         position: fixed;
@@ -469,6 +485,11 @@
           <button class="lsh-primary" type="button">提交任务</button>
           <div class="lsh-help">左键点击座位圆点会打开本面板并自动填入座位号；任务会按记录的房间和设定时间发起网络预约。</div>
           <div class="lsh-section-title">
+            <span>当前预约</span>
+            <span data-lsh-reservation-count></span>
+          </div>
+          <div class="lsh-reservation-list"></div>
+          <div class="lsh-section-title">
             <span>当前任务</span>
             <span data-lsh-count></span>
           </div>
@@ -485,6 +506,8 @@
     dom.close = root.querySelector('.lsh-close');
     dom.room = root.querySelector('.lsh-room');
     dom.submit = root.querySelector('.lsh-primary');
+    dom.reservationList = root.querySelector('.lsh-reservation-list');
+    dom.reservationCount = root.querySelector('[data-lsh-reservation-count]');
     dom.taskList = root.querySelector('.lsh-task-list');
     dom.count = root.querySelector('[data-lsh-count]');
     dom.loginStatus = root.querySelector('[data-lsh-login-status]');
@@ -510,6 +533,11 @@
     Object.values(dom.fields).forEach(field => {
       field.addEventListener('input', () => syncFieldToForm(field));
       field.addEventListener('change', () => syncFieldToForm(field));
+    });
+    dom.reservationList.addEventListener('click', event => {
+      const button = event.target.closest('[data-lsh-cancel-reservation]');
+      if (!button) return;
+      cancelReservation(button.getAttribute('data-lsh-cancel-reservation'));
     });
     dom.taskList.addEventListener('click', event => {
       const button = event.target.closest('[data-lsh-cancel]');
@@ -656,6 +684,7 @@
       : `当前页面：${location.hash || '未进入座位预约页'}`;
     dom.targetRoom.textContent = targetRoomLabel();
     renderLoginCheck();
+    renderReservations();
 
     for (const [key, input] of Object.entries(dom.fields)) {
       if (document.activeElement !== input) input.value = fieldDisplayValue(key, state.form[key]);
@@ -700,9 +729,223 @@
     return '目标房间：未记录，请先进入目标房间页或左键点选座位';
   }
 
+  function renderReservations() {
+    if (!dom.reservationList) return;
+    const items = state.reservations.items;
+    updateReservationSummary();
+
+    if (!items.length) {
+      dom.reservationList.innerHTML = `<div class="lsh-empty">${escapeHtml(reservationEmptyText())}</div>`;
+      return;
+    }
+
+    dom.reservationList.innerHTML = items
+      .map(item => {
+        const uuid = reservationUuid(item);
+        const seat = reservationSeatLabel(item);
+        const room = reservationRoomLabel(item);
+        const time = reservationTimeLabel(item);
+        const status = reservationStatusLabel(item);
+        const cancelDisabled = state.reservations.loading || !uuid;
+        return `
+          <div class="lsh-reservation">
+            <div class="lsh-task-top">
+              <div>
+                <div class="lsh-task-seat">${escapeHtml(seat || '未知座位')}</div>
+                <div class="lsh-task-meta">${escapeHtml(room || '未知房间')}</div>
+                <div class="lsh-task-meta">${escapeHtml(time || '未知时间')}</div>
+              </div>
+              <button class="lsh-cancel" type="button" data-lsh-cancel-reservation="${escapeHtml(uuid)}" ${cancelDisabled ? 'disabled' : ''}>取消预约</button>
+            </div>
+            <div class="lsh-task-status">${escapeHtml(status)}</div>
+          </div>
+        `;
+      })
+      .join('');
+  }
+
+  function updateReservationSummary() {
+    if (!dom.reservationCount) return;
+    const now = new Date();
+    const clock = formatClock(now);
+    const count = state.reservations.items.length;
+    const loadingText = state.reservations.loading ? ' · 刷新中' : '';
+    const nextRefreshText = state.reservations.loading
+      ? '正在刷新'
+      : `下次刷新：${Math.max(0, Math.ceil((state.reservations.nextAt - now.getTime()) / 1000))} 秒后`;
+    const lastRefreshText = state.reservations.lastFetchedAt
+      ? formatClock(new Date(state.reservations.lastFetchedAt))
+      : '尚未刷新';
+
+    dom.reservationCount.textContent = `${count} · ${clock}${loadingText}`;
+    dom.reservationCount.title = `当前时间：${clock}；上次刷新：${lastRefreshText}；${nextRefreshText}`;
+  }
+
+  function reservationEmptyText() {
+    if (state.reservations.loading) return '正在刷新当前预约';
+    if (/失败/.test(state.reservations.status)) return state.reservations.status;
+    return '暂无当前预约';
+  }
+
+  function reservationTick() {
+    if (!state.panelOpen || state.reservations.loading) return;
+    if (Date.now() >= state.reservations.nextAt) refreshReservations();
+  }
+
+  async function refreshReservations(force = false) {
+    if (state.reservations.loading) return;
+    if (!force && Date.now() < state.reservations.nextAt) return;
+
+    state.reservations.loading = true;
+    state.reservations.status = '正在刷新当前预约';
+    renderReservations();
+
+    try {
+      const user = await getCurrentUser();
+      const params = reservationListParams();
+      const result = await requestApi(`/ic-web/reserve/resvInfo?${params.toString()}`, {
+        token: user.token
+      });
+      state.reservations.items = extractReservationRows(result.data);
+      state.reservations.lastFetchedAt = Date.now();
+      state.reservations.status = '刷新成功';
+    } catch (error) {
+      state.reservations.status = `刷新失败：${error.message || error}`;
+    } finally {
+      state.reservations.loading = false;
+      state.reservations.nextAt = Date.now() + RESERVATION_REFRESH_INTERVAL_MS;
+      renderReservations();
+    }
+  }
+
+  async function cancelReservation(uuid) {
+    const targetUuid = String(uuid || '').trim();
+    if (!targetUuid) {
+      toast('当前预约缺少取消标识，无法取消');
+      return;
+    }
+    if (state.reservations.loading) {
+      toast('当前预约列表正在刷新，请稍后再试');
+      return;
+    }
+
+    const item = state.reservations.items.find(row => reservationUuid(row) === targetUuid);
+    const label = item ? reservationSeatLabel(item) : '该预约';
+    if (!window.confirm(`确定取消预约 ${label} 吗？`)) return;
+
+    let shouldRefresh = false;
+    state.reservations.loading = true;
+    state.reservations.status = '正在取消预约';
+    renderReservations();
+
+    try {
+      const user = await getCurrentUser();
+      const result = await requestApi('/ic-web/reserve/delete', {
+        body: JSON.stringify({ uuid: targetUuid }),
+        method: 'POST',
+        token: user.token
+      });
+      shouldRefresh = true;
+      toast(result.message || '预约已取消');
+    } catch (error) {
+      state.reservations.status = `取消失败：${error.message || error}`;
+      toast(state.reservations.status);
+    } finally {
+      state.reservations.loading = false;
+      state.reservations.nextAt = shouldRefresh ? 0 : Date.now() + RESERVATION_REFRESH_INTERVAL_MS;
+      renderReservations();
+    }
+
+    if (shouldRefresh) refreshReservations(true);
+  }
+
+  function reservationListParams() {
+    const begin = startOfDay(new Date());
+    const end = addDays(begin, RESERVATION_LOOKAHEAD_DAYS);
+    return new URLSearchParams({
+      beginDate: toDateText(begin),
+      endDate: toDateText(end),
+      needStatus: '6',
+      page: '1',
+      pageNum: String(RESERVATION_PAGE_SIZE),
+      orderKey: 'gmt_create',
+      orderModel: 'desc'
+    });
+  }
+
+  function extractReservationRows(data) {
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.list)) return data.list;
+    if (Array.isArray(data?.records)) return data.records;
+    if (Array.isArray(data?.rows)) return data.rows;
+    if (Array.isArray(data?.data)) return data.data;
+    return [];
+  }
+
+  function reservationUuid(item) {
+    return String(
+      item?.uuid ||
+      item?.resvUuid ||
+      item?.reserveUuid ||
+      item?.resvDevInfoList?.[0]?.uuid ||
+      ''
+    ).trim();
+  }
+
+  function reservationDeviceInfo(item) {
+    if (Array.isArray(item?.resvDevInfoList) && item.resvDevInfoList.length) return item.resvDevInfoList[0] || {};
+    if (Array.isArray(item?.resvDevs) && item.resvDevs.length) return item.resvDevs[0] || {};
+    return {};
+  }
+
+  function reservationSeatLabel(item) {
+    const device = reservationDeviceInfo(item);
+    return device.devName || item?.devName || item?.resvDevName || item?.seatName || item?.resvId || '';
+  }
+
+  function reservationRoomLabel(item) {
+    const device = reservationDeviceInfo(item);
+    return device.roomName || item?.roomName || item?.resvRoomName || '';
+  }
+
+  function reservationStatusLabel(item) {
+    return String(item?.resvStatusName || item?.statusName || item?.resvStatusDesc || item?.statusDesc || '可取消预约');
+  }
+
+  function reservationTimeLabel(item) {
+    return joinReservationTime(item?.resvBeginTime || item?.beginTime, item?.resvEndTime || item?.endTime);
+  }
+
+  function joinReservationTime(beginValue, endValue) {
+    const begin = formatReservationDateTime(beginValue);
+    const end = formatReservationDateTime(endValue);
+    if (begin && end && begin.slice(0, 10) === end.slice(0, 10)) {
+      return `${begin} - ${end.slice(11)}`;
+    }
+    if (begin && end) return `${begin} - ${end}`;
+    return begin || end || '';
+  }
+
+  function formatReservationDateTime(value) {
+    if (value === undefined || value === null || value === '') return '';
+    if (typeof value === 'number' || /^\d{10,13}$/.test(String(value).trim())) {
+      const number = Number(value);
+      const date = new Date(number < 100000000000 ? number * 1000 : number);
+      if (!Number.isNaN(date.getTime())) {
+        return `${toDateText(date)} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+      }
+    }
+    const text = String(value).trim().replace('T', ' ');
+    return /^\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}/.test(text)
+      ? text.slice(0, 16)
+      : text;
+  }
+
   function appTick() {
     schedulerTick();
     loginCheckTick();
+    reservationTick();
+    updateReservationSummary();
     updateTaskCountdowns();
   }
 
@@ -916,6 +1159,7 @@
   function togglePanel(open) {
     state.panelOpen = open;
     render();
+    if (open) refreshReservations(true);
   }
 
   function readForm() {
@@ -1067,6 +1311,7 @@
       task.completedAt = new Date().toISOString();
       task.lastRunOn = toDateText(new Date());
       task.status = result || `预约成功：${toDateText(new Date())} ${new Date().toLocaleTimeString()}`;
+      state.reservations.nextAt = 0;
       notify('立信座位助手', task.status);
       toast(task.status);
     } catch (error) {
@@ -1092,10 +1337,8 @@
     const [startTime, endTime] = task.timeRange.split('-').map(toTimeWithSeconds);
     if (!startTime || !endTime) throw new Error('预约时间段无效');
 
-    const userInfo = await requestApi(LOGIN_PROBE_FALLBACK_PATH);
-    const user = userInfo.data || {};
+    const user = await getCurrentUser();
     const accNo = user.accNo;
-    if (!accNo) throw new Error('无法读取当前登录用户');
 
     task.status = `执行中：查询座位 ${task.seatId}`;
     saveTasks();
@@ -1131,6 +1374,13 @@
     });
     const message = result.message || '提交成功';
     return `预约成功：${task.seatId} ${targetDate} ${startTime.slice(0, 5)}-${endTime.slice(0, 5)}（${message}）`;
+  }
+
+  async function getCurrentUser() {
+    const userInfo = await requestApi(LOGIN_PROBE_FALLBACK_PATH);
+    const user = userInfo.data || {};
+    if (!user.accNo) throw new Error('无法读取当前登录用户');
+    return user;
   }
 
   async function requestApi(url, options = {}) {
@@ -1258,6 +1508,10 @@
 
   function formatDateTimeInput(date) {
     return `${toDateText(date)} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  }
+
+  function formatClock(date) {
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
   }
 
   function defaultRunAt() {
