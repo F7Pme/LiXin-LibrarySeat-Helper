@@ -4,6 +4,10 @@
 
 作者：顾佳俊 23级金融科技 联系微信：AL-0729-zK
 
+## 运行效果
+
+![立信座位助手运行效果](screenshots/library-seat-helper-panel.png)
+
 ## 文件
 
 - `lixin-library-seat-helper.user.js`：直接安装到 Tampermonkey 的用户脚本。
@@ -48,3 +52,7 @@
 - 脚本不绕过验证码、登录、权限、预约规则或频率限制。
 - 默认申请说明为空，写在脚本顶部的 `DEFAULT_APPLY_NOTE` 常量里。
 - 到达设定时间后有 10 分钟宽限窗口；如果浏览器未打开、页面不可访问或错过窗口，任务会标记为已错过，不会事后补提交。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE)。
